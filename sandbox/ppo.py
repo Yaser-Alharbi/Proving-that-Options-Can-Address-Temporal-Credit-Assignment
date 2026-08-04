@@ -4,6 +4,7 @@ import random
 import time
 from dataclasses import dataclass
 from minigrid.wrappers import ImgObsWrapper
+from options import OptionWrapper, make_option_list
 
 import gymnasium as gym
 import numpy as np
@@ -82,11 +83,13 @@ def make_env(env_id, idx, capture_video, run_name):
         if capture_video and idx == 0:
             env = gym.make(env_id, render_mode="rgb_array")
             env = ImgObsWrapper(env)
+            env = OptionWrapper(env, make_option_list([0, 1, 2], 2))
             env = gym.wrappers.FlattenObservation(env)
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
             env = gym.make(env_id)
             env = ImgObsWrapper(env)
+            env = OptionWrapper(env, make_option_list([0, 1, 2], 2))
             env = gym.wrappers.FlattenObservation(env)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         return env
@@ -134,7 +137,7 @@ if __name__ == "__main__":
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    run_name = f"{args.env_id}__{args.exp_name}__seed{args.seed}__{time.strftime('%m-%d_%H-%M')}"
     if args.track:
         import wandb
 
@@ -165,6 +168,7 @@ if __name__ == "__main__":
     envs = gym.vector.SyncVectorEnv(
         [make_env(args.env_id, i, args.capture_video, run_name) for i in range(args.num_envs)],
     )
+    print("n actions:", envs.single_action_space.n)
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
     agent = Agent(envs).to(device)

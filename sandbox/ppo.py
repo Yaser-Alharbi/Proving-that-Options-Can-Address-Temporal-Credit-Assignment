@@ -20,6 +20,8 @@ from torch.utils.tensorboard import SummaryWriter
 class Args:
     env_id: str = "MiniGrid-Empty-5x5-v0"
     total_timesteps: int = 200000
+    use_options: bool = False
+    """whether to wrap the environment with the option wrapper"""
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
     """the name of this experiment"""
     seed: int = 1
@@ -78,18 +80,20 @@ class Args:
     """the number of iterations (computed in runtime)"""
 
 
-def make_env(env_id, idx, capture_video, run_name):
-    def thunk():
+def make_env(env_id, idx, capture_video, run_name, use_options):
+    def thunk():    
         if capture_video and idx == 0:
             env = gym.make(env_id, render_mode="rgb_array")
             env = ImgObsWrapper(env)
-            env = OptionWrapper(env, make_option_list([0, 1, 2], 2))
+            if use_options:
+                env = OptionWrapper(env, make_option_list([0, 1, 2], 2))
             env = gym.wrappers.FlattenObservation(env)
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
             env = gym.make(env_id)
             env = ImgObsWrapper(env)
-            env = OptionWrapper(env, make_option_list([0, 1, 2], 2))
+            if use_options:
+                env = OptionWrapper(env, make_option_list([0, 1, 2], 2))
             env = gym.wrappers.FlattenObservation(env)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         return env
@@ -137,7 +141,8 @@ if __name__ == "__main__":
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
-    run_name = f"{args.env_id}__{args.exp_name}__seed{args.seed}__{time.strftime('%m-%d_%H-%M')}"
+    condition = "options" if args.use_options else "baseline"
+    run_name = f"{args.env_id}__{condition}__seed{args.seed}__{time.strftime('%m-%d_%H-%M')}"
     if args.track:
         import wandb
 
@@ -166,7 +171,7 @@ if __name__ == "__main__":
 
     # env setup
     envs = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, i, args.capture_video, run_name) for i in range(args.num_envs)],
+        [make_env(args.env_id, i, args.capture_video, run_name, args.use_options) for i in range(args.num_envs)],
     )
     print("n actions:", envs.single_action_space.n)
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"

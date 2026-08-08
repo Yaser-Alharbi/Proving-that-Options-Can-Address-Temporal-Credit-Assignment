@@ -4,7 +4,7 @@ import random
 import time
 from dataclasses import dataclass
 from minigrid.wrappers import ImgObsWrapper
-from options import OptionWrapper, make_option_list
+from options import OptionWrapper, make_repeat_options, DOORKEY_SPECS
 
 import gymnasium as gym
 import numpy as np
@@ -86,14 +86,14 @@ def make_env(env_id, idx, capture_video, run_name, use_options):
             env = gym.make(env_id, render_mode="rgb_array")
             env = ImgObsWrapper(env)
             if use_options:
-                env = OptionWrapper(env, make_option_list([0, 1, 2], 2))
+                env = OptionWrapper(env, make_repeat_options(DOORKEY_SPECS))
             env = gym.wrappers.FlattenObservation(env)
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
             env = gym.make(env_id)
             env = ImgObsWrapper(env)
             if use_options:
-                env = OptionWrapper(env, make_option_list([0, 1, 2], 2))
+                env = OptionWrapper(env, make_repeat_options(DOORKEY_SPECS))
             env = gym.wrappers.FlattenObservation(env)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         return env

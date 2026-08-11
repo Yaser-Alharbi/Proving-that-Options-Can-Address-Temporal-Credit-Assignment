@@ -5,6 +5,7 @@ import pathlib
 import random
 import time
 from dataclasses import dataclass
+from typing import Optional
 
 import gymnasium as gym
 import numpy as np
@@ -12,10 +13,11 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import tyro
+from nle import nethack
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
 
-from envs import GLYPH_SHAPE, GLYPH_SIZE, NUM_GLYPHS, make_env
+from envs import CROP, CROP_SIZE, MAP_H, MAP_SIZE, MAP_W, N_STATS, make_env
 
 
 @dataclass
@@ -33,12 +35,11 @@ class Args:
     torch_deterministic: bool = True
     """if toggled, `torch.backends.cudnn.deterministic=False`"""
     cuda: bool = True
-    """if toggled, cuda will be enabled by default"""
     track: bool = False
     """if toggled, this experiment will be tracked with Weights and Biases"""
     wandb_project_name: str = "cleanRL"
     """the wandb's project name"""
-    wandb_entity: str = None
+    wandb_entity: Optional[str] = None
     """the entity (team) of wandb's project"""
 
     # Algorithm specific arguments
@@ -70,7 +71,7 @@ class Args:
     """coefficient of the value function"""
     max_grad_norm: float = 0.5
     """the maximum norm for the gradient clipping"""
-    target_kl: float = None
+    target_kl: Optional[float] = None
     """the target KL divergence threshold"""
 
     # to be filled in runtime
@@ -89,41 +90,59 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 
 
 class Agent(nn.Module):
-    def __init__(self, envs, embed_dim=16, hidden=256):
+    def __init__(self, envs, embed_dim=16, hidden=512):
         super().__init__()
-        self.embed = nn.Embedding(NUM_GLYPHS, embed_dim)
-        self.conv = nn.Sequential(
-            layer_init(nn.Conv2d(embed_dim, 32, 3, stride=2, padding=1)),
-            nn.ReLU(),
-            layer_init(nn.Conv2d(32, 64, 3, stride=2, padding=1)),
-            nn.ReLU(),
-            layer_init(nn.Conv2d(64, 64, 3, stride=2, padding=1)),
-            nn.ReLU(),
+        self.n_glyphs = nethack.MAX_GLYPH + 1
+        self.embed = nn.Embedding(self.n_glyphs, embed_dim)
+
+        self.map_conv = nn.Sequential(
+            layer_init(nn.Conv2d(embed_dim, 32, 3, stride=2, padding=1)), nn.ReLU(),
+            layer_init(nn.Conv2d(32, 64, 3, stride=2, padding=1)), nn.ReLU(),
+            layer_init(nn.Conv2d(64, 64, 3, stride=2, padding=1)), nn.ReLU(),
             nn.Flatten(),
         )
-        conv_out = 64 * 3 * 10
-        stat_size = int(np.prod(envs.single_observation_space.shape)) - GLYPH_SIZE
-        self.stats = nn.Sequential(layer_init(nn.Linear(stat_size, 32)), nn.ReLU())
+        self.crop_conv = nn.Sequential(
+            layer_init(nn.Conv2d(embed_dim, 32, 3, stride=1, padding=1)), nn.ReLU(),
+            layer_init(nn.Conv2d(32, 64, 3, stride=2, padding=1)), nn.ReLU(),
+            nn.Flatten(),
+        )
+        self.stats_net = nn.Sequential(
+            nn.LayerNorm(N_STATS),
+            layer_init(nn.Linear(N_STATS, 64)), nn.ReLU(),
+        )
+
+        with torch.no_grad():
+            dummy = torch.zeros(1, embed_dim, MAP_H, MAP_W)
+            map_out = self.map_conv(dummy).shape[1]
+            dummy = torch.zeros(1, embed_dim, CROP, CROP)
+            crop_out = self.crop_conv(dummy).shape[1]
+
         self.trunk = nn.Sequential(
-            layer_init(nn.Linear(conv_out + 32, hidden)), nn.ReLU()
+            layer_init(nn.Linear(map_out + crop_out + 64, hidden)), nn.ReLU()
         )
         self.actor = layer_init(nn.Linear(hidden, envs.single_action_space.n), std=0.01)
         self.critic = layer_init(nn.Linear(hidden, 1), std=1.0)
 
     def encode(self, x):
-        glyphs = x[:, :GLYPH_SIZE].long().view(-1, *GLYPH_SHAPE)
-        g = self.embed(glyphs).permute(0, 3, 1, 2)
-        g = self.conv(g)
-        s = self.stats(x[:, GLYPH_SIZE:])
-        return self.trunk(torch.cat([g, s], dim=1))
+        glyphs = x[:, :MAP_SIZE].long().clamp(0, self.n_glyphs - 1)
+        crop = x[:, MAP_SIZE : MAP_SIZE + CROP_SIZE].long().clamp(0, self.n_glyphs - 1)
+        stats = x[:, MAP_SIZE + CROP_SIZE :]
+
+        m = self.embed(glyphs.view(-1, MAP_H, MAP_W)).permute(0, 3, 1, 2)
+        m = self.map_conv(m)
+
+        c = self.embed(crop.view(-1, CROP, CROP)).permute(0, 3, 1, 2)
+        c = self.crop_conv(c)
+
+        s = self.stats_net(stats)
+        return self.trunk(torch.cat([m, c, s], dim=1))
 
     def get_value(self, x):
         return self.critic(self.encode(x))
 
     def get_action_and_value(self, x, action=None):
         h = self.encode(x)
-        logits = self.actor(h)
-        probs = Categorical(logits=logits)
+        probs = Categorical(logits=self.actor(h))
         if action is None:
             action = probs.sample()
         return action, probs.log_prob(action), probs.entropy(), self.critic(h)
@@ -173,6 +192,7 @@ if __name__ == "__main__":
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+    print(device)
 
     # env setup
     envs = gym.vector.SyncVectorEnv(

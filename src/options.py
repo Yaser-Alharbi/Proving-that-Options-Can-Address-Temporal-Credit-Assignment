@@ -1,7 +1,7 @@
 import gymnasium as gym
 from nle import nethack
 
-MOVE_REPEATS = [1, 2, 4, 8]
+MOVE_REPEATS = [1, 2, 4, 8, 16]
 
 COMPASS = [
     nethack.CompassDirection.N,
@@ -17,11 +17,20 @@ COMPASS = [
 SINGLE_COMMANDS = [
     nethack.MiscDirection.DOWN,
     nethack.MiscDirection.UP,
+    nethack.MiscDirection.WAIT,
     nethack.Command.PICKUP,
     nethack.Command.SEARCH,
-    nethack.Command.OPEN,
     nethack.Command.KICK,
     nethack.Command.PRAY,
+    nethack.Command.LOOT,
+    nethack.Command.SIT,
+    nethack.Command.FORCE,
+    nethack.Command.TAKEOFFALL,
+    nethack.Command.FIRE,
+    nethack.Command.SWAP,
+    nethack.Command.CHAT,
+    nethack.Command.ENGRAVE,
+    nethack.Command.AUTOPICKUP,
 ]
 
 ARG_COMMANDS = [
@@ -31,15 +40,34 @@ ARG_COMMANDS = [
     nethack.Command.QUAFF,
     nethack.Command.READ,
     nethack.Command.APPLY,
+    nethack.Command.DROP,
+    nethack.Command.PUTON,
+    nethack.Command.REMOVE,
+    nethack.Command.TAKEOFF,
+]
+
+DIR_COMMANDS = [
+    nethack.Command.OPEN,
+    nethack.Command.CLOSE,
+    nethack.Command.FIGHT,
+    nethack.Command.UNTRAP,
 ]
 
 INVENTORY_SLOTS = "abcdefghij"
 
 
 def make_options(env_actions):
+    """Build option sequences for this env's action list.
 
+    Every non-movement option ends with ESC so any prompt the command opened
+    is cancelled before the next option runs. Without this an unanswered
+    prompt swallows the following option's first keystroke.
+    """
     index = {a: i for i, a in enumerate(env_actions)}
     options, names = [], []
+
+    esc = index.get(nethack.Command.ESC)
+    tail = (esc,) if esc is not None else ()
 
     for direction in COMPASS:
         if direction not in index:
@@ -50,7 +78,7 @@ def make_options(env_actions):
 
     for command in SINGLE_COMMANDS:
         if command in index:
-            options.append((index[command],))
+            options.append((index[command],) + tail)
             names.append(command.name.lower())
 
     for command in ARG_COMMANDS:
@@ -59,8 +87,17 @@ def make_options(env_actions):
         for slot in INVENTORY_SLOTS:
             if ord(slot) not in index:
                 continue
-            options.append((index[command], index[ord(slot)]))
+            options.append((index[command], index[ord(slot)]) + tail)
             names.append(f"{command.name.lower()}_{slot}")
+
+    for command in DIR_COMMANDS:
+        if command not in index:
+            continue
+        for direction in COMPASS:
+            if direction not in index:
+                continue
+            options.append((index[command], index[direction]) + tail)
+            names.append(f"{command.name.lower()}_{direction.name}")
 
     return options, names
 

@@ -39,12 +39,12 @@ class NLEObsWrapper(gym.ObservationWrapper):
         ])
 
 
-def make_env(env_id, seed, idx, use_options):
+def make_env(env_id, seed, idx, use_options, gamma=0.99):
     def thunk():
         env = gym.make(env_id)
         if use_options:
             options, _ = make_options(env.unwrapped.actions)
-            env = OptionWrapper(env, options)
+            env = OptionWrapper(env, options, gamma=gamma)
         env = NLEObsWrapper(env)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         env.reset(seed=seed + idx)

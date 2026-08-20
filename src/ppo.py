@@ -41,6 +41,8 @@ class Args:
     """the wandb's project name"""
     wandb_entity: Optional[str] = None
     """the entity (team) of wandb's project"""
+    smdp_discount: bool = True
+    """apply gamma per primitive step rather than per decision"""
 
     # Algorithm specific arguments
     learning_rate: float = 2.5e-4
@@ -194,9 +196,8 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
     print(device)
 
-    # env setup
     envs = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, args.seed, i, args.use_options) for i in range(args.num_envs)],
+        [make_env(args.env_id, args.seed, i, args.use_options, args.gamma) for i in range(args.num_envs)],
     )
     print("n actions:", envs.single_action_space.n)
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
@@ -209,6 +210,7 @@ if __name__ == "__main__":
     actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
     logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
     rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    discounts = torch.zeros((args.num_steps, args.num_envs)).to(device)
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
     values = torch.zeros((args.num_steps, args.num_envs)).to(device)
 
@@ -250,6 +252,13 @@ if __name__ == "__main__":
             else:
                 primitive_step += args.num_envs
 
+            if args.smdp_discount and "option_discount" in infos:
+                step_discount = np.where(infos["_option_discount"], infos["option_discount"], args.gamma)
+            else:
+                step_discount = np.full(args.num_envs, args.gamma)
+            discounts[step] = torch.tensor(step_discount, dtype=torch.float32).to(device)
+        
+            
             if "raw_return" in infos:
                 mask = infos["_raw_return"]
                 for r, l in zip(infos["raw_return"][mask], infos["primitive_length"][mask]):
@@ -271,8 +280,8 @@ if __name__ == "__main__":
                 else:
                     nextnonterminal = 1.0 - dones[t + 1]
                     nextvalues = values[t + 1]
-                delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
-                advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
+                delta = rewards[t] + discounts[t] * nextvalues * nextnonterminal - values[t]
+                advantages[t] = lastgaelam = delta + discounts[t] * args.gae_lambda * nextnonterminal * lastgaelam
             returns = advantages + values
 
         # flatten the batch

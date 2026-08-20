@@ -103,23 +103,28 @@ def make_options(env_actions):
 
 
 class OptionWrapper(gym.Wrapper):
-    """Execute an option open-loop and return the undiscounted reward sum"""
+    """Execute an option open-loop, returning the SMDP-discounted reward sum.
+    """
 
-    def __init__(self, env, options):
+    def __init__(self, env, options, gamma=0.99):
         super().__init__(env)
         self.options = options
+        self.gamma = gamma
         self.action_space = gym.spaces.Discrete(len(options))
 
     def step(self, option_id):
         total_reward = 0.0
         steps = 0
+        discount = 1.0
         for action in self.options[option_id]:
             obs, reward, terminated, truncated, info = self.env.step(action)
-            total_reward += reward
+            total_reward += discount * reward
+            discount *= self.gamma
             steps += 1
             if terminated or truncated:
                 break
         info["primitive_steps"] = steps
+        info["option_discount"] = discount
         return obs, total_reward, terminated, truncated, info
 
 

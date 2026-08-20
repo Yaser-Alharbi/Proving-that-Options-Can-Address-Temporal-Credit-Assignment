@@ -5,6 +5,7 @@ dependencies:
   - python=3.11
   - pip
   - pip:
+      # src/ (NetHack, PyTorch)
       - torch
       - minigrid
       - gymnasium
@@ -12,3 +13,12 @@ dependencies:
       - tyro
       - tensorboard
       - nle
+      # navix/ (JAX). jax[cuda12] pulls the GPU plugin
+      - jax[cuda12]
+      - navix
+      - flax
+      - optax
+      - distrax
+      - rlax
+      - matplotlib
+      - pandas

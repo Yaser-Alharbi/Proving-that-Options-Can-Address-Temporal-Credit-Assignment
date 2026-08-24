@@ -29,7 +29,7 @@ RUNS = HERE / "runs"
 
 _DEFAULT_ARGS = Args() # default arguments for `Cell.name`.
 
-_NAMED_IF_NONDEFAULT = ("budget", "max_forward", "max_steps", "gamma", "discount", "executor") # fields appended to `Cell.name` if non-default.
+_NAMED_IF_NONDEFAULT = ("budget", "max_forward", "max_steps", "gamma", "discount", "executor", "reward_delay") # fields appended to `Cell.name` if non-default.
 
 
 def configure_environment() -> None:
@@ -131,6 +131,7 @@ class Cell:
             "budget": self.args.budget,
             "max_forward": self.args.max_forward,
             "max_steps": self.args.max_steps,
+            "reward_delay": self.args.reward_delay,
             "gamma": self.args.gamma,
             "discount": self.args.discount,
             "executor": self.args.executor,
@@ -238,6 +239,8 @@ def episode_frame(cell: Cell, seeds: Sequence[int], logs: Dict[str, object]):
 
     seed_at, update_at, step_at, _ = np.nonzero(done)
     terminated = np.asarray(logs["step_type"])[done] == int(StepType.TERMINATION)
+    lengths = np.asarray(logs["lengths"])[done]
+    decisions = np.asarray(logs["decision_t"])[done]
     return pd.DataFrame(
         {
             **cell.identity,
@@ -245,8 +248,9 @@ def episode_frame(cell: Cell, seeds: Sequence[int], logs: Dict[str, object]):
             "decision_step": decision[seed_at, update_at, step_at],
             "primitive_step": primitive[seed_at, update_at, step_at],
             "episodic_return": np.asarray(logs["returns"])[done],
-            "episodic_length": np.asarray(logs["lengths"])[done],
+            "episodic_length": lengths,
             "terminated": terminated.astype(int),
+            "mean_option_duration": lengths / decisions,
         }
     )
 

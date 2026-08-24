@@ -29,6 +29,8 @@ class Args:
     """primitive steps before truncation. Set explicitly: DoorKey-8x8 solves in
     ~25 steps, so the registry default of 100 leaves no horizon for credit
     assignment to matter."""
+    reward_delay: int = 0
+    """Steps delay before paying terminal reward. 0 is off."""
     budget: int = 1_000_000
     """training budget in PRIMITIVE steps"""
     discount: Literal["decision", "primitive"] = "decision"

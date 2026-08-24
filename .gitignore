@@ -222,3 +222,6 @@ runs/
 results/
 markdowns/
 plots/
+*.md
+logs/
+

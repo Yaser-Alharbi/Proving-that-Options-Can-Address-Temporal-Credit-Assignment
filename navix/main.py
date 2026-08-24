@@ -27,6 +27,10 @@ if TYPE_CHECKING:
 HERE = pathlib.Path(__file__).resolve().parent
 RUNS = HERE / "runs"
 
+_DEFAULT_ARGS = Args() # default arguments for `Cell.name`.
+
+_NAMED_IF_NONDEFAULT = ("budget", "max_forward", "max_steps", "gamma", "discount", "executor") # fields appended to `Cell.name` if non-default.
+
 
 def configure_environment() -> None:
     """Set JAX's device and compilation-cache variables, where unset."""
@@ -98,6 +102,10 @@ class Cell:
                 f"n{self.args.n_options}",
                 f"os{self.args.option_seed}",
             ]
+        for field in _NAMED_IF_NONDEFAULT:
+            value = getattr(self.args, field)
+            if value != getattr(_DEFAULT_ARGS, field):
+                parts.append(f"{field}{value}")
         if self.args.tag:
             parts.append(self.args.tag)
         return "__".join(parts)
@@ -123,6 +131,7 @@ class Cell:
             "budget": self.args.budget,
             "max_forward": self.args.max_forward,
             "max_steps": self.args.max_steps,
+            "gamma": self.args.gamma,
             "discount": self.args.discount,
             "executor": self.args.executor,
             "tag": self.args.tag,

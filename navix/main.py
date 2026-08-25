@@ -64,10 +64,32 @@ class Sweep:
     seeds: Tuple[int, ...] = (0, 1, 2)
 
 
+ANALYSIS_SEEDS: Tuple[int, ...] = tuple(range(10))
+"""plot.py's MIN_SEEDS_FOR_IQM is 8, if below estimate falls back to median-and-range not bootstrapped IQM interval."""
+
 SWEEPS: Dict[str, Sweep] = {
-    # at max_forward=4 the catalogue is 128 rows, so at n=128 both families hold
-    # the same option set and the two curves coincide by construction
-    "sweep": Sweep(Args(max_forward=4, tag="sweep")),
+    "exp1": Sweep(
+        Args(max_forward=4, tag="exp1"),
+        families=("grammar",),
+        n_options=(64,),
+        seeds=ANALYSIS_SEEDS,
+    ),
+    "exp2": Sweep(
+        Args(max_forward=4, tag="exp2"),
+        conditions=("action", "option"),
+        families=("grammar",),
+        n_options=(8, 16, 32, 64, 128),
+        seeds=ANALYSIS_SEEDS,
+    ),
+    # n=64, not 128: at max_forward=4 the catalogue is 128 rows, so at n=128
+    # `random.sample` returns the whole catalogue and the two families coincide
+    "exp3": Sweep(
+        Args(max_forward=4, tag="exp3"),
+        conditions=("option",),
+        families=("random", "grammar"),
+        n_options=(64,),
+        seeds=ANALYSIS_SEEDS,
+    ),
     # reach 4 covers proportionally less of a 16x16 map, and holding the slack
     # ratio over a longer solution needs a longer truncation
     "hard": Sweep(
@@ -414,7 +436,7 @@ def run_cell(cell: Cell, vmap_seeds: bool = True) -> None:
 def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     """Parse the command line."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--sweep", default="sweep", choices=sorted(SWEEPS))
+    parser.add_argument("--sweep", default="exp1", choices=sorted(SWEEPS))
     parser.add_argument("--cell", action="append", help="run only these cells")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--force", action="store_true", help="redo completed cells")

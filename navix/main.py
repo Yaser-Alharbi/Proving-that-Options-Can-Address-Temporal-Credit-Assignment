@@ -27,9 +27,16 @@ if TYPE_CHECKING:
 HERE = pathlib.Path(__file__).resolve().parent
 RUNS = HERE / "runs"
 
+GROUP_STAMP = time.strftime("%m%d-%H%M%S") # one stamp per invocation for `{group}`
+
 _DEFAULT_ARGS = Args() # default arguments for `Cell.name`.
 
 _NAMED_IF_NONDEFAULT = ("budget", "max_forward", "max_steps", "gamma", "discount", "executor", "reward_delay") # fields appended to `Cell.name` if non-default.
+
+
+def cell_name(directory: pathlib.Path) -> str:
+    """A cell's store-relative name, `{group}/{cell}`."""
+    return directory.relative_to(RUNS).as_posix()
 
 
 def configure_environment() -> None:
@@ -115,7 +122,7 @@ SWEEPS: Dict[str, Sweep] = {
 
 @dataclass(frozen=True)
 class Cell:
-    """One point of the matrix, named without its seeds or a timestamp."""
+    """One point of the matrix, named without its seeds, inside a timestamped group."""
 
     args: Args
     seeds: Tuple[int, ...]
@@ -138,12 +145,15 @@ class Cell:
         return "__".join(parts)
 
     @property
-    def directory(self) -> pathlib.Path:
-        return RUNS / self.name
+    def group(self) -> str:
+        parts = [GROUP_STAMP, self.args.env_id]
+        if self.args.tag:
+            parts.append(self.args.tag)
+        return "__".join(parts)
 
     @property
-    def complete(self) -> bool:
-        return (self.directory / "meta.json").exists()
+    def directory(self) -> pathlib.Path:
+        return RUNS / self.group / self.name
 
     @property
     def identity(self) -> Dict[str, object]:
@@ -328,6 +338,7 @@ class Results:
         frames = int(stacked["iter/frames"][:, -1].sum())
         meta = {
             "cell": self.cell.name,
+            "group": self.cell.group,
             "seeds": list(self.cell.seeds),
             "args": dataclasses.asdict(self.cell.args),
             "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -439,7 +450,6 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--sweep", default="exp1", choices=sorted(SWEEPS))
     parser.add_argument("--cell", action="append", help="run only these cells")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--force", action="store_true", help="redo completed cells")
     parser.add_argument(
         "--no-vmap",
         action="store_true",
@@ -461,40 +471,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if options.dry_run:
         print(f"{len(cells)} cells in sweep {options.sweep!r}:")
         for cell in cells:
-            print(
-                f"  [{'done' if cell.complete else 'todo'}] {cell.name} "
-                f"seeds={list(cell.seeds)}"
-            )
-        return 0
-
-    pending = [cell for cell in cells if options.force or not cell.complete]
-    for cell in cells:
-        if cell not in pending:
-            print(f"skipping {cell.name}: already present", flush=True)
-    if not pending:
+            print(f"  {cell.name} seeds={list(cell.seeds)}")
         return 0
 
     assert_gpu()
     print("Checking option catalogues...")
-    assert_catalogues(pending)
-
-    if options.force:
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        for cell in pending:
-            if cell.directory.exists():
-                cell.directory.rename(
-                    cell.directory.with_name(f"{cell.directory.name}__old_{stamp}")
-                )
+    assert_catalogues(cells)
 
     failures: List[Cell] = []
-    for cell in pending:
+    for cell in cells:
         try:
             run_cell(cell, vmap_seeds=not options.no_vmap)
         except Exception:
             traceback.print_exc()
             failures.append(cell)
 
-    print(f"\n{len(pending) - len(failures)}/{len(pending)} cells complete.")
+    print(f"\n{len(cells) - len(failures)}/{len(cells)} cells complete.")
     for cell in failures:
         print(
             f"  failed: {cell.name}\n"

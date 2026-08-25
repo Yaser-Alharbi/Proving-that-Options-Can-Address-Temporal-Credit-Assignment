@@ -83,6 +83,11 @@ SWEEPS: Dict[str, Sweep] = {
         Args(max_forward=4, budget=3_000_000, tag="long-baseline-3M"),
         conditions=("action",),
     ),
+    "smoke": Sweep(
+    Args(max_forward=4, budget=200_000, tag="smoke"),
+    n_options=(8, 16),
+    seeds=tuple(range(10))
+    ),
 }
 
 
@@ -273,11 +278,14 @@ class Results:
         frame.to_csv(path, mode="a", header=not path.exists(), index=False)
         self.episodes += len(frame)
         for position, seed in enumerate(seeds):
+            # Store only data with shape (num_seeds, updates) or (num_seeds, updates, num_options);
+            # skip arrays that have more dimensions (per-step or render data).
+   
             self.diagnostics.setdefault(seed, []).append(
                 {
                     key: np.asarray(value)[position]
                     for key, value in logs.items()
-                    if np.ndim(value) == 2
+                    if np.ndim(value) in (2, 3)
                 }
             )
 
@@ -449,8 +457,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     assert_catalogues(pending)
 
     if options.force:
+        stamp = time.strftime("%Y%m%d-%H%M%S")
         for cell in pending:
-            shutil.rmtree(cell.directory, ignore_errors=True)
+            if cell.directory.exists():
+                cell.directory.rename(
+                    cell.directory.with_name(f"{cell.directory.name}__old_{stamp}")
+                )
 
     failures: List[Cell] = []
     for cell in pending:

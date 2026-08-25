@@ -20,7 +20,7 @@ PRIMITIVE = -1
 NO_INTERACT = -1
 
 NEEDS_NOTHING = 0
-NEEDS_KEY = 1
+NEEDS_PICKABLE = 1
 NEEDS_OPENABLE_DOOR = 2
 NEEDS_POCKET = 3
 
@@ -52,7 +52,7 @@ DETOUR_EPISODE_COST = 5
 lateral, move and turn back, or 2 + 1 + 2 for the reverse."""
 
 _PRECONDITION = {
-    "pickup": NEEDS_KEY,
+    "pickup": NEEDS_PICKABLE,
     "toggle": NEEDS_OPENABLE_DOOR,
     "open": NEEDS_OPENABLE_DOOR,
     "drop": NEEDS_POCKET,
@@ -317,8 +317,8 @@ def _detour_aim(neighbours: Array, home_aim: Array) -> Array:
 
 
 def _ray(state: State, depth: int) -> Tuple[Array, Array, Array]:
-    """Per heading over the cells `0..depth` ahead: a loose key, an openable shut
-    door, and the distance to the first cell the player cannot walk into."""
+    """Per heading over the cells `0..depth` ahead: a loose pickable, an openable
+    shut door, and the distance to the first cell the player cannot walk into."""
     player = state.get_player()
     origin = jnp.zeros((2,), dtype=jnp.int32)
     steps = jnp.stack([translate(origin, jnp.asarray(d)) for d in HEADINGS])
@@ -349,11 +349,13 @@ def _ray(state: State, depth: int) -> Tuple[Array, Array, Array]:
         here = jnp.all(positions[:, None, None, :] == cells[None], axis=-1)
         return jnp.any(here & mask[:, None, None], axis=0) & inside
 
-    key_at = jnp.zeros(inside.shape, dtype=jnp.bool_)
-    if Entities.KEY in state.entities:
-        keys = state.get_keys()
-        loose = ~positions_equal(keys.position, DISCARD_PILE_COORDS)
-        key_at = occupied_by(keys.position, loose)
+    pickable_at = jnp.zeros(inside.shape, dtype=jnp.bool_)
+    for name in state.entities:
+        entity = state.entities[name]
+        if not isinstance(entity, Pickable):
+            continue
+        loose = ~positions_equal(entity.position, DISCARD_PILE_COORDS)
+        pickable_at = pickable_at | occupied_by(entity.position, loose)
 
     door_openable_at = jnp.zeros(inside.shape, dtype=jnp.bool_)
     if Entities.DOOR in state.entities:
@@ -364,7 +366,7 @@ def _ray(state: State, depth: int) -> Tuple[Array, Array, Array]:
             doors.position, shut & (unlocked | (doors.requires == player.pocket))
         )
 
-    return key_at, door_openable_at, first_blocked.astype(jnp.int32)
+    return pickable_at, door_openable_at, first_blocked.astype(jnp.int32)
 
 
 def _pile_size(state: State) -> Array:
@@ -479,7 +481,7 @@ def initiation(spec: OptionSpec, state: State) -> Array:
         jnp.asarray(False),
     )
 
-    key_at, door_openable_at, first_blocked = _ray(state, spec.max_reach + 1)
+    pickable_at, door_openable_at, first_blocked = _ray(state, spec.max_reach + 1)
     # a primitive row has no heading and no precondition, so its ray index only has to stay in bounds
     ray_heading = jnp.maximum(spec.heading, 0)
     reachable = spec.reach + 1
@@ -487,10 +489,10 @@ def initiation(spec: OptionSpec, state: State) -> Array:
     # exact at `arrival` for a non-following row that only rotates and advances; a following
     # row may detour, so it takes the looser test of anywhere on the ray
     following = spec.follow == 1
-    key_ahead = jnp.where(
+    pickable_ahead = jnp.where(
         following,
-        (jnp.cumsum(key_at, axis=1) > 0)[ray_heading, reachable],
-        key_at[ray_heading, arrival],
+        (jnp.cumsum(pickable_at, axis=1) > 0)[ray_heading, reachable],
+        pickable_at[ray_heading, arrival],
     )
     door_ahead = jnp.where(
         following,
@@ -502,8 +504,8 @@ def initiation(spec: OptionSpec, state: State) -> Array:
     room_ahead = following | (arrival < first_blocked[ray_heading])
 
     met = jnp.where(
-        spec.requires == NEEDS_KEY,
-        key_ahead,
+        spec.requires == NEEDS_PICKABLE,
+        pickable_ahead,
         jnp.where(
             spec.requires == NEEDS_OPENABLE_DOOR,
             door_ahead,

@@ -386,14 +386,16 @@ def test_follow_ping_pongs_in_a_dead_end_within_budget() -> None:
     assert int(unspent) == STATUS_DETOUR
 
 
-@pytest.mark.parametrize("max_forward", (2, 4, 8))
+# paired, not crossed: n=128 exceeds the 64-row catalogue at max_forward=2, and
+# `_catalogue` orders follow rows last, so n=64 at max_forward=4 holds no follow row
+@pytest.mark.parametrize("max_forward,n_options", ((2, 64), (4, 64), (4, 128), (8, 64)))
 @pytest.mark.parametrize("seed", range(4))
 def test_max_duration_bounds_duration_without_its_disjunct(
-    seed: int, max_forward: int
+    seed: int, max_forward: int, n_options: int
 ) -> None:
     """Every execution finishes inside its row's `_max_duration`, even with `spec.max_duration` inflated so that disjunct never fires."""
     loose = 200
-    rows, _ = grammar_options(64, max_forward, NAMES)
+    rows, _ = grammar_options(n_options, max_forward, NAMES)
     spec = OptionSpec.create(rows, NAMES)
     spec = spec.replace(
         max_duration=jnp.full_like(spec.max_duration, loose), horizon=loose

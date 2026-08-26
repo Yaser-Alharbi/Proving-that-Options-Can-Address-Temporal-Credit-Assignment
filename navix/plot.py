@@ -513,6 +513,26 @@ def collinear(frame: pd.DataFrame, key: str, column: str) -> bool:
     """True where `column` takes a single value within every group of `key`."""
     return bool((frame.groupby(key)[column].nunique() <= 1).all())
 
+def labels_for(conditions: Iterable[str]) -> str:
+    """The given conditions named in legend order, as a phrase, or an empty string."""
+    present = set(conditions)
+    return ", ".join(label for condition, label in CONDITION_LABEL.items()
+                     if condition in present)
+
+def omitted_note(data: Inputs, frame: pd.DataFrame, table: pd.DataFrame) -> str:
+    """Conditions this figure's own frame carried that it drew no line for.
+
+    On the figure, not only in `aggregate_curve`'s warning: a condition dropped for want of
+    a window reads exactly like a condition that was never run. Against `frame`, not
+    `data.episodes`, so a cell `require_columns` dropped is not blamed on the window.
+    """
+    absent = set(frame.condition) - set(table.condition)
+    if not absent or "terminated" not in data.episodes.columns:
+        return ""
+    rows = data.episodes[data.episodes.condition.isin(absent)]
+    return (f"{labels_for(absent)} omitted: terminated {rows.terminated.mean():.2%} "
+            "of episodes, over no step range every seed covers")
+
 def curve_figure(data: Inputs, frame: pd.DataFrame, column: str,
                  ylabel: str) -> Tuple[Figure, pd.DataFrame]:
     """A column's estimate against primitive steps, one band per cell."""
@@ -523,8 +543,9 @@ def curve_figure(data: Inputs, frame: pd.DataFrame, column: str,
     apply_x_scale([axis], table)
     axis.set_xlabel(X_LABEL)
     axis.set_ylabel(ylabel)
+    caption = caption_for(table, varying, (f"{data.args.window}-episode moving average",))
     finish(figure, [axis], environments(frame),
-           caption_for(table, varying, (f"{data.args.window}-episode moving average",)))
+           "\n".join(filter(None, [caption, omitted_note(data, frame, table)])))
     return figure, table
 
 def return_curve(data: Inputs) -> Tuple[Figure, pd.DataFrame]:
@@ -553,8 +574,6 @@ def length_curve(data: Inputs) -> Tuple[Figure, pd.DataFrame]:
     # across conditions unconverted; among terminated episodes only, since a truncated one
     # reports the truncation limit rather than a cost of solving
     solved = frame[frame.terminated == 1]
-    for name in sorted(set(frame.cell) - set(solved.cell)):
-        warn(f"length_curve drops {name}: no episode of it terminated")
     if solved.empty:
         raise MissingData("no episode of any matching cell terminated")
     return curve_figure(data, solved, "episodic_length",
@@ -722,13 +741,30 @@ FIGURES: Dict[str, Callable[[Inputs], Tuple[Figure, pd.DataFrame]]] = {
 DISABLED = frozenset({"option_usage"})
 """Registered but not drawn unless named; each raises `MissingData` saying why."""
 
-def selected(args: argparse.Namespace) -> List[str]:
-    """The registry entries to attempt, in registry order."""
-    unknown = (set(args.only or []) | set(args.skip or [])) - set(FIGURES)
-    if unknown:
-        raise SystemExit(f"unknown figures: {', '.join(sorted(unknown))}")
+EXPERIMENT_FIGURES: Dict[str, Tuple[str, ...]] = {
+    "exp1": ("return_curve", "threshold_table", "length_curve"),
+    "exp2": ("option_count_sweep", "return_curve"),
+    "exp3": ("family_overlay", "return_curve", "threshold_table"),
+}
+"""What each experiment's tag is there to show; an untagged or unknown group draws
+everything not `DISABLED`."""
+
+def tags_of(frame: pd.DataFrame) -> List[str]:
+    """The tags present in one group's episodes."""
+    return [] if frame.empty else [str(tag) for tag in frame["tag"].unique()]
+
+def tag_figures(tags: Sequence[str]) -> List[str]:
+    """The registry entries this experiment asks for, in registry order."""
+    # startswith, not equality: a variant sweep tags its cells `exp1_16x16_Random`, and it
+    # wants the figures of the experiment it varies
+    wanted = {name for key, names in EXPERIMENT_FIGURES.items()
+              if any(tag.startswith(key) for tag in tags) for name in names}
+    return [name for name in FIGURES if name in (wanted or set(FIGURES) - DISABLED)]
+
+def selected(args: argparse.Namespace, resolved: Sequence[str]) -> List[str]:
+    """The entries of `resolved` to attempt under `--only` and `--skip`."""
     return [name for name in FIGURES
-            if (name in args.only if args.only else name not in DISABLED)
+            if (name in args.only if args.only else name in resolved)
             and name not in (args.skip or [])]
 
 def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -754,10 +790,25 @@ def slice_of(frame: pd.DataFrame, group: str) -> pd.DataFrame:
     """The rows of `frame` belonging to one run group."""
     return frame if frame.empty else frame[frame["group"] == group]
 
-def draw_group(names: Sequence[str], data: Inputs, directory: pathlib.Path) -> int:
-    """Draw the named figures for one group, returning how many were written."""
+def draw_group(names: Sequence[str], resolved: Sequence[str], data: Inputs,
+               directory: pathlib.Path) -> int:
+    """Draw `names` for one group, returning how many were written.
+
+    `resolved` is what the group's experiment asks for, which is what an output is an orphan
+    against; `names` is the subset this invocation draws.
+    """
     csv_directory = directory / "csv"
     csv_directory.mkdir(parents=True, exist_ok=True)
+    # cleared before drawing and rewritten only by a figure that succeeds, so a figure
+    # dropped from the experiment's set, and one that skipped on MissingData, leave nothing
+    # behind to be read as current. A figure the experiment wants but `--only` is not
+    # drawing keeps its file: asking for one figure is not a change of configuration.
+    for name in FIGURES:
+        if name in resolved and name not in names:
+            continue
+        for stale in (directory / f"{name}.{data.args.format}",
+                      csv_directory / f"{name}.csv"):
+            stale.unlink(missing_ok=True)
     # ahead of the figures, and unconditionally: the measured durations convert the budget
     # into decisions whether or not `duration_vs_cap` had two caps to draw
     if not data.meta.empty:
@@ -782,10 +833,10 @@ def draw_group(names: Sequence[str], data: Inputs, directory: pathlib.Path) -> i
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """Draw every selected figure for each run group of the store."""
     args = parse_arguments(argv)
-    names = selected(args)
-    if not names:
-        print("no figures selected")
-        return 1
+    # ahead of the loaders, so a typo fails before anything reads `runs/`
+    unknown = (set(args.only or []) | set(args.skip or [])) - set(FIGURES)
+    if unknown:
+        raise SystemExit(f"unknown figures: {', '.join(sorted(unknown))}")
 
     loaded = []
     for loader in (load_episodes, load_meta):
@@ -802,7 +853,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         directory = PLOTS / short(group)
         print(f"{directory.name}:")
         data = Inputs(slice_of(episodes, group), slice_of(meta, group), args)
-        written += draw_group(names, data, directory)
+        resolved = tag_figures(tags_of(data.episodes))
+        names = selected(args, resolved)
+        if not names:
+            warn("no figures selected for this group")
+            continue
+        written += draw_group(names, resolved, data, directory)
         attempted += len(names)
 
     print(f"\n{written}/{attempted} figures written under {PLOTS}")

@@ -1,177 +1,813 @@
-"""Plot episodic return against primitive steps and decisions, side by side."""
+"""Figures for the navix experiment matrix, one registry entry each.
+
+Every figure returns the frame it drew, and the runner writes that frame beside the image,
+so a figure can be regenerated without reading `runs/` again.
+"""
 
 import argparse
+import fnmatch
+import json
 import pathlib
-import textwrap
-from typing import List, Optional, Sequence, Tuple
+import sys
+from dataclasses import dataclass
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
+import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
+from matplotlib.ticker import ScalarFormatter
+from scipy.stats import trim_mean
 
-from main import RUNS
+from config import Args
+from main import RUNS, THRESHOLDS, cell_name
+
+matplotlib.use("Agg")
 
 PLOTS = pathlib.Path(__file__).resolve().parent / "plots"
 
-FIGURE_SIZE = (12, 6)
-FIGURE_DPI = 150
-MEAN_LINE_WIDTH = 2.5
-GRID_ALPHA = 0.3
-CAPTION_WRAP_WIDTH = 56
-CAPTION_BOTTOM_MARGIN = 0.22
-TITLE_TOP_MARGIN = 0.88
+MIN_SEEDS_FOR_IQM = 8
+"""Below this a 25% trim keeps too few values to be a trimmed mean."""
 
-DECISIONS_CAPTION = (
-    "The decisions axis is not budget-matched: one option decision consumes "
-    "several primitive steps. The action condition is identical in both panels "
-    "because one decision is one step there."
+IQM_TRIM = 0.25
+CI_ALPHA = 0.05
+BOOTSTRAP_SEED = 0
+
+FIGURE_SIZE = (9.0, 5.5)
+PANEL_WIDTH = 5.0
+ROW_HEIGHT = 0.4
+LINE_WIDTH = 2.0
+BAND_ALPHA = 0.2
+GRID_ALPHA = 0.3
+SMALL_FONT = 7
+LEGEND_FONT = 8
+CAP_MARKER_SIZE = 400
+ERROR_CAP_SIZE = 4
+X_LABEL = "primitive steps"
+
+SCI_LIMITS = (-3, 4)
+"""Tick magnitudes printed plainly; a step axis exceeds this, a duration does not."""
+
+LEGEND_TOP = 0.0
+"""Figure fraction the legend hangs from, so it clears the figure entirely."""
+
+DEFAULT_THRESHOLD = 0.5
+"""Crossing threshold for a cell whose sweep declares none."""
+
+SETTLE_TOL = 0.02
+"""Fraction of a curve's own range within which it counts as no longer changing."""
+
+LOG_X_RATIO = 0.25
+"""Log the x axis once the fastest curve settles inside this fraction of it."""
+
+CONDITION_COLOR: Dict[str, str] = {"action": "#4c72b0", "option": "#dd8452", "both": "#55a868"}
+CONDITION_LABEL: Dict[str, str] = {
+    "action": "action space", "option": "option space",
+    "both": "both (option + action space)",
+}
+FAMILY_DASH: Dict[str, str] = {"grammar": "-", "random": "--"}
+
+SERIES_KEYS: Tuple[str, ...] = (
+    "env_id", "condition", "family", "option_seed", "budget", "max_forward", "max_steps",
+    "reward_delay", "gamma", "discount", "executor", "tag",
+)
+"""Everything identifying a cell but its catalogue size, so a sweep over `n_options` never
+pools two cells differing in anything else."""
+
+IDENTITY: Tuple[str, ...] = SERIES_KEYS + ("n_options",)
+
+OPTION_ONLY: Tuple[str, ...] = ("family", "n_options", "option_seed")
+"""Fields `Cell.identity` fills with a sentinel on an `action` cell, so a difference in one
+of them between an action cell and an option cell means only "not applicable"."""
+
+ARGS_FIELD: Dict[str, str] = {"condition": "action_space", "family": "option_family"}
+"""Identity columns whose `Args` field carries another name."""
+
+FIELD_PREFIX: Dict[str, str] = {"family": "", "n_options": "n="}
+"""How a varying field is written in a legend entry; anything else is written `key=`."""
+
+DEFAULTS = Args()
+"""`Cell.name` elides a field left at its default, so a caption elides it too."""
+
+UNTAGGED = "untagged"
+"""Group name for cells run without a tag, which `Cell.name` simply omits."""
+
+DURATION_MARKERS: Tuple[Tuple[str, str, str], ...] = (
+    ("nominal_option_len", "nominal", "o"),
+    ("mean_option_len", "measured mean", "s"),
+    ("duration_max_lane_mean", "worst lane, mean", "^"),
+    ("duration_max_lane_max", "worst lane, max", "D"),
 )
 
+CENSORED: Dict[str, object] = {
+    "point": float("nan"), "low": float("nan"), "high": float("nan"), "method": "censored",
+}
 
-def load(names: Optional[Sequence[str]]) -> pd.DataFrame:
-    """Every selected cell's episodes, concatenated into one frame."""
+METHOD_PHRASE: Dict[str, str] = {
+    "iqm-bootstrap": f"IQM with {1 - CI_ALPHA:.0%} bootstrap CI",
+    "median-range": "median with observed range",
+}
+"""How a method reads on a figure; the sidecar CSVs keep the token itself."""
+
+
+class MissingData(Exception):
+    """A figure cannot be drawn from the cells present."""
+
+def warn(message: str) -> None:
+    """Print a non-fatal problem with the store."""
+    print(f"  warning: {message}")
+
+def short(name: str, prefix: str = "") -> str:
+    """A name without `prefix` or the environment boilerplate, for ticks and legends."""
+    return name.removeprefix(prefix).replace("Navix-", "").replace("-v0", "")
+
+def common_group(names: Iterable[str]) -> str:
+    """The `{group}/` prefix every cell name in `names` shares, or an empty string."""
+    groups = {str(name).split("/")[0] for name in names}
+    return f"{groups.pop()}/" if len(groups) == 1 else ""
+
+def cell_directories(patterns: Sequence[str]) -> List[pathlib.Path]:
+    """Every cell directory under a group whose store-relative name matches one of `patterns`."""
     if not RUNS.exists():
         raise SystemExit(f"no results yet: {RUNS} does not exist")
-    directories = sorted(
-        directory
-        for directory in RUNS.iterdir()
-        if (directory / "episodes.csv").exists()
-        and (not names or directory.name in names)
-    )
-    if not directories:
-        raise SystemExit(f"no cells in {RUNS} matching {list(names or ['*'])}")
-    return pd.concat(
-        [
-            pd.read_csv(directory / "episodes.csv").assign(cell=directory.name)
-            for directory in directories
-        ],
-        ignore_index=True,
-    )
+    found = [d for d in sorted(RUNS.glob("*/*"))
+             if d.is_dir() and any(fnmatch.fnmatch(cell_name(d), p) for p in patterns)]
+    if not found:
+        raise SystemExit(f"no cells in {RUNS} matching {list(patterns)}")
+    return found
+
+def load_episodes(patterns: Sequence[str]) -> pd.DataFrame:
+    """Every matching cell's episodes, concatenated, with `cell` and `group` columns."""
+    frames = []
+    for directory in cell_directories(patterns):
+        path = directory / "episodes.csv"
+        if path.exists():
+            frames.append(pd.read_csv(path).assign(cell=cell_name(directory),
+                                                   group=directory.parent.name))
+        else:
+            warn(f"{cell_name(directory)} has no episodes.csv")
+    if not frames:
+        raise MissingData("no matching cell has an episodes.csv")
+    frame = pd.concat(frames, ignore_index=True)
+    frame["tag"] = frame.tag.fillna(UNTAGGED).replace("", UNTAGGED)
+    return frame
+
+def load_meta(patterns: Sequence[str]) -> pd.DataFrame:
+    """One row per matching cell, from `meta.json`, with `duration_stats` flattened."""
+    rows: List[Dict[str, object]] = []
+    for directory in cell_directories(patterns):
+        path = directory / "meta.json"
+        if not path.exists():
+            warn(f"{cell_name(directory)} has no meta.json, so it never finished")
+            continue
+        meta = json.loads(path.read_text())
+        arguments = meta["args"]
+        rows.append({
+            "cell": cell_name(directory),
+            "group": directory.parent.name,
+            "env_id": arguments["env_id"],
+            "condition": arguments["action_space"],
+            "family": arguments["option_family"],
+            "n_options": arguments["n_options"],
+            "tag": arguments["tag"] or UNTAGGED,
+            **{k: meta[k] for k in ("max_option_len", "mean_option_len", "nominal_option_len")},
+            **{f"duration_{k}": v for k, v in meta["duration_stats"].items()},
+        })
+    if not rows:
+        raise MissingData("no matching cell has a meta.json")
+    return pd.DataFrame(rows)
+
+def require_columns(frame: pd.DataFrame, columns: Sequence[str], what: str) -> pd.DataFrame:
+    """`frame` less any cell missing one of `columns`."""
+    absent = [column for column in columns if column not in frame.columns]
+    if absent:
+        raise MissingData(f"{what} needs {', '.join(absent)}, absent from every cell")
+    usable = frame.dropna(subset=list(columns))
+    for name in sorted(set(frame.cell) - set(usable.cell)):
+        warn(f"{what} drops {name}: it predates {', '.join(columns)}")
+    if usable.empty:
+        raise MissingData(f"{what} found no cell carrying {', '.join(columns)}")
+    return usable
 
 
-def label_for(cell: pd.DataFrame) -> str:
-    """A legend label built from the columns rather than the directory name."""
-    first = cell.iloc[0]
-    if first.condition == "action":
-        parts = ["action", first.tag]
+@dataclass(frozen=True)
+class Estimate:
+    """A point estimate with an interval, and the method that produced it."""
+
+    point: np.ndarray
+    low: np.ndarray
+    high: np.ndarray
+    method: str
+    n_seeds: int
+
+    def row(self) -> Dict[str, object]:
+        """The scalar case, as columns of a table."""
+        return {**{k: float(getattr(self, k)) for k in ("point", "low", "high")},
+                "method": self.method}
+
+def iqm(values: np.ndarray, axis: int = 0) -> np.ndarray:
+    """Interquartile mean along `axis`, as rliable defines it."""
+    return trim_mean(values, IQM_TRIM, axis=axis)
+
+def bootstrap_indices(strata: np.ndarray, resamples: int, rng: np.random.Generator) -> np.ndarray:
+    """`(resamples, n_seeds)` seed positions, resampled with replacement within each stratum."""
+    indices = np.empty((resamples, strata.size), dtype=np.intp)
+    for stratum in np.unique(strata):
+        at = np.flatnonzero(strata == stratum)
+        indices[:, at] = rng.choice(at, size=(resamples, at.size), replace=True)
+    return indices
+
+def estimate(per_seed: np.ndarray, strata: np.ndarray, resamples: int,
+             rng: np.random.Generator) -> Estimate:
+    """The IQM of `(n_seeds, ...)` with a stratified bootstrap interval, or median and range."""
+    n_seeds = per_seed.shape[0]
+    if n_seeds < MIN_SEEDS_FOR_IQM:
+        point, low, high = np.median(per_seed, 0), per_seed.min(0), per_seed.max(0)
+        method = "median-range"
     else:
-        parts = [first.condition, first.family, f"n{first.n_options}", first.tag]
-    return " ".join(str(part) for part in parts if part)
+        # one draw for the whole array: a curve's band is an envelope of resampled
+        # curves, not a stack of independent per-bin intervals
+        draws = iqm(per_seed[bootstrap_indices(strata, resamples, rng)], axis=1)
+        low, high = np.quantile(draws, [CI_ALPHA / 2, 1 - CI_ALPHA / 2], axis=0)
+        point, method = iqm(per_seed), "iqm-bootstrap"
+    return Estimate(*(np.asarray(v) for v in (point, low, high)), method, n_seeds)
+
+def first_of(frame: pd.DataFrame) -> Dict[str, object]:
+    """The identifying columns of a group, from its first row."""
+    first = frame.iloc[0]
+    return {key: first[key] for key in IDENTITY if key in frame.columns}
+
+def stratum_of(run: pd.DataFrame) -> str:
+    """The bootstrap stratum a seed belongs to: its environment and option seed."""
+    first = run.iloc[0]
+    return f"{first.env_id}|{first.option_seed}"
+
+def curve_window(frame: pd.DataFrame) -> Tuple[int, int]:
+    """The primitive steps from the last seed's first episode to the first seed's last."""
+    per_seed = frame.groupby(["cell", "seed"]).primitive_step.agg(["min", "max"])
+    return int(per_seed["min"].max()), int(per_seed["max"].min())
+
+def per_seed_curves(frame: pd.DataFrame, column: str, grid: np.ndarray,
+                    window: int) -> Tuple[np.ndarray, np.ndarray]:
+    """`(n_seeds, len(grid))` smoothed values on `grid`, and each row's stratum."""
+    curves, strata = [], []
+    for _, run in frame.groupby(["cell", "seed"]):
+        run = run.sort_values("primitive_step")
+        # min_periods=1, so the curve starts at the seed's first episode rather than its
+        # `window`th, which for a fast cell is already past the whole climb. The reason to
+        # demand a full window is threshold crossing, and `crossing_step` demands it there.
+        smoothed = run[column].rolling(window, min_periods=1).mean().to_numpy()
+        # `grid` starts at the last seed's first episode, so no seed is interpolated
+        # outside its own range, where `np.interp` would clamp rather than say nothing
+        curves.append(np.interp(grid, run.primitive_step.to_numpy(), smoothed))
+        strata.append(stratum_of(run))
+    return np.stack(curves), np.asarray(strata)
+
+def crossing_step(run: pd.DataFrame, column: str, threshold: float,
+                  window: int) -> float:
+    """One seed's primitive step at its first trailing mean of `column` past `threshold`.
+
+    Read off the seed's own episodes, not off an interpolated grid whose bin width scales
+    with the run length and quantises every cell to the same few steps.
+    """
+    run = run.sort_values("primitive_step")
+    # min_periods=window: a seed whose first episode happened to succeed would otherwise
+    # cross at its first step, and one too short to fill a window never crossed
+    smoothed = run[column].rolling(window, min_periods=window).mean().to_numpy()
+    at = np.flatnonzero(smoothed >= threshold)
+    return float(run.primitive_step.to_numpy()[at[0]]) if at.size else float("nan")
 
 
-def default_name(frame: pd.DataFrame) -> str:
-    """An output filename summarising the environments and conditions plotted."""
-    environments = "-".join(sorted(frame.env_id.unique()))
-    conditions = "-".join(sorted(frame.condition.unique()))
-    return f"{environments}__{conditions}.png"
+@dataclass(frozen=True)
+class Inputs:
+    """What every figure is handed: the two loaded frames and the options."""
 
+    episodes: pd.DataFrame
+    meta: pd.DataFrame
+    args: argparse.Namespace
 
-def plot_mean_curve(
-    axis: Axes,
-    seeds: List[Tuple[np.ndarray, np.ndarray]],
-    x_max: float,
-    bins: int,
-    label: Optional[str],
-    color: str,
-) -> None:
-    """Interpolate each seed's curve onto a common grid and plot only the mean."""
-    grid = np.linspace(0, x_max, bins)
-    stacked = np.stack([np.interp(grid, x, y) for x, y in seeds])  # (S, bins)
-    axis.plot(grid, stacked.mean(axis=0), label=label, color=color,
-              linewidth=MEAN_LINE_WIDTH)
+    def grid(self, start: int, end: int) -> np.ndarray:
+        """Geometrically over `[start, end]`, the span every seed of a cell covers.
 
+        Geometric, not uniform: a uniform grid over a million steps puts its first point
+        past the entire climb of a cell that solves in a few thousand.
+        """
+        return np.geomspace(float(start), float(end), self.args.bins)
 
-def format_axis_in_standard_form(axis: Axes, which: str) -> None:
-    """Show an axis's tick labels in standard form (scientific notation)."""
-    axis.ticklabel_format(axis=which, style="sci", scilimits=(0, 0), useMathText=True)
+def aggregate_curve(data: Inputs, frame: pd.DataFrame, column: str,
+                    rng: np.random.Generator) -> pd.DataFrame:
+    """One row per cell and grid point, over the span every seed of that cell covers.
 
+    A grid per cell, not one at the shortest cell's limit: the budget buys a cell as many
+    decisions as its options are long, so a slow baseline outlives every option cell and
+    truncating it to their limit hides it still climbing.
+    """
+    tables = []
+    for name, cell in frame.groupby("cell"):
+        start, end = curve_window(cell)
+        # an estimator sees every seed at every grid point or none: `trim_mean` and
+        # `np.median` both return NaN from a single missing seed, and a NaN curve draws
+        # as a legend entry with no line
+        if start >= end:
+            warn(f"{name} has no span every seed covers: the last seed starts at "
+                 f"{start:,}, the first ends at {end:,}")
+            continue
+        grid = data.grid(start, end)
+        curves, strata = per_seed_curves(cell, column, grid, data.args.window)
+        result = estimate(curves, strata, data.args.resamples, rng)
+        tables.append(pd.DataFrame({
+            "cell": name, "group": cell.group.iloc[0], **first_of(cell),
+            "primitive_step": grid, "point": result.point, "low": result.low,
+            "high": result.high, "method": result.method, "n_seeds": result.n_seeds,
+            "limit": end,
+        }))
+    if not tables:
+        raise MissingData("no cell has a span every one of its seeds covers")
+    return pd.concat(tables, ignore_index=True)
 
-def add_decisions_caption(figure: Figure, ax_decisions: Axes) -> None:
-    """Note under the right panel that the decisions axis is not budget-matched."""
-    figure.text(
-        ax_decisions.get_position().x0,
-        0.02,
-        textwrap.fill(DECISIONS_CAPTION, width=CAPTION_WRAP_WIDTH),
-        ha="left",
-        va="bottom",
-        fontsize=8,
-    )
+def aggregate_final(data: Inputs, frame: pd.DataFrame, rng: np.random.Generator) -> Estimate:
+    """The estimate over each seed's last `--tail` of primitive steps."""
+    values, strata = [], []
+    for _, run in frame.groupby(["cell", "seed"]):
+        reached = run.primitive_step.max()
+        tail = run[run.primitive_step > (1 - data.args.tail) * reached]
+        values.append(tail.episodic_return.mean())
+        strata.append(stratum_of(run))
+    return estimate(np.asarray(values), np.asarray(strata), data.args.resamples, rng)
 
+def threshold_for(data: Inputs, cell: pd.DataFrame) -> float:
+    """`--threshold`, else what this cell's sweep declared, else `DEFAULT_THRESHOLD`."""
+    if data.args.threshold is not None:
+        return float(data.args.threshold)
+    first = cell.iloc[0]
+    return THRESHOLDS.get((first.env_id, first.tag), DEFAULT_THRESHOLD)
 
-def main() -> None:
-    """Plot the selected cells, averaging each cell's seeds into one curve."""
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("cells", nargs="*", help="cell names (default: every cell)")
-    parser.add_argument("--window", type=int, default=100)
-    parser.add_argument("--bins", type=int, default=200)
-    parser.add_argument("--out", default=None,
-                        help="bare filenames land in navix/plots/; a path is used as given")
-    args = parser.parse_args()
+def steps_to_threshold(data: Inputs, frame: pd.DataFrame, rng: np.random.Generator) -> pd.DataFrame:
+    """Primitive steps to reach each cell's threshold, excluding seeds that never do."""
+    rows = []
+    for name, cell in frame.groupby("cell"):
+        threshold = threshold_for(data, cell)
+        crossings = [crossing_step(run, "episodic_return", threshold, data.args.window)
+                     for _, run in cell.groupby("seed")]
+        strata = np.asarray([stratum_of(run) for _, run in cell.groupby("seed")])
+        crossed = np.isfinite(crossings)
+        n_seeds, n_crossed = len(crossings), int(crossed.sum())
+        # pinning a non-crossing seed to the limit would bias the estimate down by
+        # an amount the budget sets, so it is dropped and the fraction reported
+        measured = estimate(np.asarray(crossings)[crossed], strata[crossed],
+                            data.args.resamples, rng).row() \
+            if 2 * n_crossed >= n_seeds else CENSORED
+        rows.append({
+            "cell": name, "group": cell.group.iloc[0], **first_of(cell),
+            "threshold": threshold, **measured, "n_crossed": n_crossed,
+            "n_seeds": n_seeds, "limit": curve_window(cell)[1],
+        })
+    return pd.DataFrame(rows)
 
-    frame = load(args.cells)
-    # every curve is truncated to the shortest seed of any cell, so the
-    # comparison is over a budget all of them actually reached
-    limit = int(frame.groupby(["cell", "seed"]).primitive_step.max().min())
-    frame = frame[frame.primitive_step <= limit]
-    print(f"truncating all cells at primitive_step={limit}")
+def varying_fields(table: pd.DataFrame) -> List[str]:
+    """The identity columns whose value differs across `table`, in `IDENTITY` order."""
+    option_rows = table[table.condition != "action"]
+    return [key for key in IDENTITY if key in table.columns
+            and (option_rows if key in OPTION_ONLY else table)[key].nunique(dropna=False) > 1]
 
-    out = pathlib.Path(args.out or default_name(frame))
-    if out.parent == pathlib.Path("."):
-        out = PLOTS / out
-    out.parent.mkdir(parents=True, exist_ok=True)
+def series_label(row: pd.Series, varying: Sequence[str]) -> str:
+    """A legend entry: the condition, then only what else separates this cell."""
+    named = [key for key in varying if key != "condition"
+             and (row.condition != "action" or key not in OPTION_ONLY)]
+    return ", ".join([CONDITION_LABEL[row.condition]]
+                     + [f"{FIELD_PREFIX.get(key, key + '=')}{short(str(row[key]))}"
+                        for key in named])
 
-    color_cycle = plt.rcParams["axes.prop_cycle"].by_key()["color"]
-    figure, (ax_primitive, ax_decisions) = plt.subplots(
-        1, 2, sharey=True, figsize=FIGURE_SIZE
-    )
-    for index, (_, cell) in enumerate(frame.groupby("cell")):
-        color = color_cycle[index % len(color_cycle)]
-        seeds = [
-            (
-                run.primitive_step.to_numpy(),
-                run.decision_step.to_numpy(),
-                run.episodic_return.rolling(args.window, min_periods=1)
-                .mean()
-                .to_numpy(),
-            )
-            for _, run in cell.groupby("seed")
-        ]
-        plot_mean_curve(
-            ax_primitive,
-            [(primitive, y) for primitive, _, y in seeds],
-            float(limit),
-            args.bins,
-            f"{label_for(cell)} (n={len(seeds)})",
-            color,
-        )
-        plot_mean_curve(
-            ax_decisions,
-            [(decision, y) for _, decision, y in seeds],
-            min(float(decision.max()) for _, decision, _ in seeds),
-            args.bins,
-            None,  # the shared legend is drawn once, on the left panel
-            color,
-        )
+def shared_estimate(table: pd.DataFrame) -> str:
+    """`n seeds, method` where every cell of `table` agrees on both, else empty."""
+    if not {"n_seeds", "method"} <= set(table.columns):
+        return ""
+    if table.n_seeds.nunique() != 1 or table.method.nunique() != 1:
+        return ""
+    method = str(table.method.iloc[0])
+    return f"{int(table.n_seeds.iloc[0])} seeds, {METHOD_PHRASE.get(method, method)}"
 
-    ax_primitive.set_xlabel("primitive steps")
-    ax_decisions.set_xlabel("decisions")
-    ax_primitive.set_ylabel(f"episodic return ({args.window}-episode moving average)")
-    figure.suptitle("-".join(sorted(frame.env_id.unique())))
-    ax_primitive.legend()
-    ax_primitive.grid(alpha=GRID_ALPHA)
-    ax_decisions.grid(alpha=GRID_ALPHA)
-    ax_decisions.tick_params(labelleft=False)
-    format_axis_in_standard_form(ax_primitive, "x")
-    format_axis_in_standard_form(ax_decisions, "x")
-    format_axis_in_standard_form(ax_primitive, "y")
+def limit_span(table: pd.DataFrame) -> str:
+    """The range of per-cell truncation limits, as one number where they agree."""
+    low, high = int(table.limit.min()), int(table.limit.max())
+    return f"{low:,}" if low == high else f"{low:,} to {high:,}"
+
+def caption_for(table: pd.DataFrame, varying: Sequence[str],
+                extra: Sequence[str] = ()) -> str:
+    """Everything every series of `table` shares, for the legend title.
+
+    A field at its `Args` default is left out, as `Cell.name` leaves it out, so the caption
+    and a legend entry together name the cell. `n_options` is the exception, named on every
+    option cell there and so named here too. The group is not named: it is the directory
+    the figure is written into, and `tag` only repeats it.
+    """
+    option_rows = table[table.condition != "action"]
+    fixed = []
+    # the catalogue size beside the family it sizes, where IDENTITY puts it last
+    catalogue = ("family", "n_options")
+    for key in catalogue + tuple(k for k in IDENTITY if k not in catalogue):
+        rows = option_rows if key in OPTION_ONLY else table
+        if key in varying or key in ("env_id", "condition", "tag") or key not in table.columns:
+            continue
+        if rows.empty or rows[key].nunique(dropna=False) != 1:
+            continue
+        value = rows[key].iloc[0]
+        if key != "n_options" and value == getattr(DEFAULTS, ARGS_FIELD.get(key, key)):
+            continue
+        written = short(str(value))
+        fixed.append(f"{written} catalogue" if key == "family"
+                     else f"{FIELD_PREFIX.get(key, key + '=')}{written}")
+
+    return "\n".join(filter(None, [
+        ", ".join(fixed), ", ".join(filter(None, [shared_estimate(table), *extra])),
+    ]))
+
+def draw_bands(axis: Axes, table: pd.DataFrame, varying: Sequence[str]) -> None:
+    """One line and interval band per cell, coloured by condition."""
+    # the seed count and method go in the caption where every cell agrees, which is the
+    # usual case, and stay on the entry where a short cell fell back to median-and-range
+    suffix = "" if shared_estimate(table) else " ({} seeds, {})"
+    # sorted by what the legend prints, so `n=8` precedes `n=16`; grouping by the cell name
+    # alone orders the legend lexically, and sort=False then keeps this order
+    conditions = list(CONDITION_LABEL)
+    order = [*dict.fromkeys(["_condition_at", *varying]), "cell"]
+    ordered = table.assign(_condition_at=table.condition.map(conditions.index))
+    for _, group in ordered.sort_values(order).groupby("cell", sort=False):
+        first = group.iloc[0]
+        color = CONDITION_COLOR[first.condition]
+        axis.plot(group.primitive_step, group.point, color=color, linewidth=LINE_WIDTH,
+                  linestyle=FAMILY_DASH.get(first.family, "-"),
+                  label=series_label(first, varying)
+                  + suffix.format(int(first.n_seeds),
+                                  METHOD_PHRASE.get(first.method, first.method)))
+        axis.fill_between(group.primitive_step, group.low, group.high, color=color,
+                          alpha=BAND_ALPHA, linewidth=0)
+
+def settled_steps(table: pd.DataFrame) -> List[float]:
+    """The step past which each cell's curve stops moving, over the cells that moved."""
+    curves = {name: group.sort_values("primitive_step").dropna(subset=["point"])
+              for name, group in table.groupby("cell")}
+    spans = {name: float(group.point.max() - group.point.min())
+             for name, group in curves.items() if not group.empty}
+    # relative to the cell that moved most: a curve flat at its floor never learned, so it
+    # is not evidence that the run settled early
+    reference = max(spans.values(), default=0.0)
+    settled = []
+    for name, span in spans.items():
+        if span <= SETTLE_TOL * reference:
+            continue
+        point = curves[name].point.to_numpy()
+        moving = np.flatnonzero(np.abs(point - point[-1]) > SETTLE_TOL * span)
+        at = min(int(moving[-1]) + 1, point.size - 1) if moving.size else 0
+        settled.append(float(curves[name].primitive_step.to_numpy()[at]))
+    return settled
+
+def apply_x_scale(axes: Sequence[Axes], table: pd.DataFrame) -> None:
+    """Log x where the fastest curve settles early, linear from zero otherwise."""
+    right = float(table.limit.max())
+    settled = settled_steps(table)
+    logarithmic = bool(settled) and min(settled) < LOG_X_RATIO * right
+    # a log axis cannot render zero, so it starts at the first x carrying an estimate, which
+    # is later than the first grid point: a cell has none until all of its seeds have
+    # finished an episode. A linear axis starts at zero, before any episode has finished.
+    drawn = table.primitive_step[table.point.notna() & (table.primitive_step > 0)]
+    for axis in axes:
+        if logarithmic:
+            axis.set_xscale("log")
+        axis.set_xlim(float(drawn.min()) if logarithmic else 0.0, right)
+
+def finish(figure: Figure, axes: Sequence[Axes], title: str, caption: str = "") -> None:
+    """Grid, scientific x labels, a title, a caption top right and a legend along the foot."""
+    for axis in axes:
+        axis.grid(alpha=GRID_ALPHA)
+        if axis.get_xscale() == "linear":
+            axis.ticklabel_format(axis="x", style="sci", scilimits=SCI_LIMITS,
+                                  useMathText=True)
+    # flushed to the canvas rather than centred or to the axes, whose left edge moves right
+    # with the width of the y tick labels: the rest of the band is then free for a caption
+    figure.suptitle(title, x=0.0, ha="left")
     figure.tight_layout()
-    figure.subplots_adjust(bottom=CAPTION_BOTTOM_MARGIN, top=TITLE_TOP_MARGIN)
-    add_decisions_caption(figure, ax_decisions)
-    figure.savefig(out, dpi=FIGURE_DPI)
-    print(f"wrote {out}")
+    if caption:
+        figure.text(1.0, 1.0, caption, ha="right", va="top", fontsize=SMALL_FONT)
+    # one legend for the whole figure, in figure coordinates and only once
+    # tight_layout has settled the axes: an axes-fraction offset lands on the x
+    # label, and a legend per panel is wider than the panel it belongs to
+    entries: Dict[str, object] = {}
+    for axis in axes:
+        for handle, label in zip(*axis.get_legend_handles_labels()):
+            # by label: panels of one figure draw the same series, and identical labels
+            # carry identical styling, so a second entry would be a duplicate
+            entries.setdefault(label, handle)
+    if entries:
+        figure.legend(list(entries.values()), list(entries), loc="upper left",
+                      frameon=False, fontsize=LEGEND_FONT, ncols=len(entries),
+                      bbox_to_anchor=(axes[0].get_position().x0, LEGEND_TOP))
+
+def environments(frame: pd.DataFrame) -> str:
+    """The environments a frame covers, for a figure title."""
+    return " / ".join(sorted(frame.env_id.unique()))
+
+def collinear(frame: pd.DataFrame, key: str, column: str) -> bool:
+    """True where `column` takes a single value within every group of `key`."""
+    return bool((frame.groupby(key)[column].nunique() <= 1).all())
+
+def curve_figure(data: Inputs, frame: pd.DataFrame, column: str,
+                 ylabel: str) -> Tuple[Figure, pd.DataFrame]:
+    """A column's estimate against primitive steps, one band per cell."""
+    table = aggregate_curve(data, frame, column, np.random.default_rng(BOOTSTRAP_SEED))
+    varying = varying_fields(table)
+    figure, axis = plt.subplots(figsize=FIGURE_SIZE)
+    draw_bands(axis, table, varying)
+    apply_x_scale([axis], table)
+    axis.set_xlabel(X_LABEL)
+    axis.set_ylabel(ylabel)
+    finish(figure, [axis], environments(frame),
+           caption_for(table, varying, (f"{data.args.window}-episode moving average",)))
+    return figure, table
+
+def return_curve(data: Inputs) -> Tuple[Figure, pd.DataFrame]:
+    """Episodic return against primitive steps."""
+    frame = require_columns(data.episodes, ("primitive_step", "episodic_return"), "return")
+    return curve_figure(data, frame, "episodic_return", "episodic return")
+
+def success_curve(data: Inputs) -> Tuple[Figure, pd.DataFrame]:
+    """Fraction of episodes that terminated, against primitive steps."""
+    frame = require_columns(
+        data.episodes, ("primitive_step", "terminated", "episodic_return"), "success"
+    )
+    if collinear(frame, "terminated", "episodic_return"):
+        raise MissingData(
+            "episodic_return takes one value per termination outcome in every loaded "
+            "cell, so a success curve is the return curve rescaled"
+        )
+    return curve_figure(data, frame, "terminated", "success rate")
+
+def length_curve(data: Inputs) -> Tuple[Figure, pd.DataFrame]:
+    """Episode length among terminated episodes, against primitive steps."""
+    frame = require_columns(
+        data.episodes, ("primitive_step", "episodic_length", "terminated"), "length"
+    )
+    # `episodic_length` is `episode_t`, primitive steps inside the episode, so it compares
+    # across conditions unconverted; among terminated episodes only, since a truncated one
+    # reports the truncation limit rather than a cost of solving
+    solved = frame[frame.terminated == 1]
+    for name in sorted(set(frame.cell) - set(solved.cell)):
+        warn(f"length_curve drops {name}: no episode of it terminated")
+    if solved.empty:
+        raise MissingData("no episode of any matching cell terminated")
+    return curve_figure(data, solved, "episodic_length",
+                        "primitive steps per terminated episode")
+
+def family_overlay(data: Inputs) -> Tuple[Figure, pd.DataFrame]:
+    """Grammar against random return curves, one panel per catalogue size."""
+    frame = require_columns(data.episodes, ("primitive_step", "episodic_return", "family"),
+                            "overlay")
+    frame = frame[frame.condition != "action"]
+    counts = [n for n, panel in frame.groupby("n_options") if panel.family.nunique() > 1]
+    for count in sorted(set(frame.n_options.unique()) - set(counts)):
+        warn(f"family_overlay drops n={count}: only one family was run at it")
+    if not counts:
+        raise MissingData("no catalogue size has both grammar and random")
+
+    frame = frame[frame.n_options.isin(counts)]
+    rng = np.random.default_rng(BOOTSTRAP_SEED)
+    tables = [aggregate_curve(data, frame[frame.n_options == count], "episodic_return", rng)
+              for count in counts]
+    combined = pd.concat(tables, ignore_index=True)
+    # n_options titles the panel, so it never names a series inside one
+    varying = [key for key in varying_fields(combined) if key != "n_options"]
+
+    # never narrower than a single-axis figure, which is what the caption is sized for
+    figure, axes = plt.subplots(
+        1, len(counts), sharey=True, squeeze=False,
+        figsize=(max(FIGURE_SIZE[0], PANEL_WIDTH * len(counts)), FIGURE_SIZE[1]),
+    )
+    for axis, count, table in zip(axes[0], counts, tables):
+        draw_bands(axis, table, varying)
+        axis.set_title(f"n = {count}")
+        axis.set_xlabel(X_LABEL)
+    apply_x_scale(list(axes[0]), combined)
+    axes[0][0].set_ylabel("episodic return")
+    finish(figure, list(axes[0]), environments(frame),
+           caption_for(combined, varying, (f"{data.args.window}-episode moving average",)))
+    return figure, combined
+
+def option_count_sweep(data: Inputs) -> Tuple[Figure, pd.DataFrame]:
+    """Final return against catalogue size, one series per otherwise-equal cell."""
+    frame = require_columns(data.episodes, ("episodic_return", "n_options"), "sweep")
+    frame = frame[frame.condition != "action"]
+    if frame.empty:
+        raise MissingData("option_count_sweep found no option cells")
+    counts = frame.n_options.unique()
+    if counts.size < 2:
+        raise MissingData("option_count_sweep needs at least two catalogue sizes; "
+                          f"every loaded cell is n={counts[0]:g}")
+
+    keys = [key for key in SERIES_KEYS if key in frame.columns]
+    rng = np.random.default_rng(BOOTSTRAP_SEED)
+    # dropna=False: reward_delay and gamma are absent from cells written before they
+    # were logged, and a dropped key would silently drop those cells
+    table = pd.DataFrame([
+        {**dict(zip(keys + ["n_options"], values)),
+         "group": group.group.iloc[0], "cells": " ".join(sorted(group.cell.unique())),
+         "n_seeds": group.groupby(["cell", "seed"]).ngroups,
+         **aggregate_final(data, group, rng).row()}
+        for values, group in frame.groupby(keys + ["n_options"], dropna=False)
+    ]).sort_values(keys + ["n_options"])
+    # n_options is the x axis, so it never names a series
+    varying = [key for key in varying_fields(table) if key != "n_options"]
+    suffix = "" if shared_estimate(table) else " ({} seeds, {})"
+
+    figure, axis = plt.subplots(figsize=FIGURE_SIZE)
+    for _, group in table.groupby(keys, dropna=False):
+        first = group.iloc[0]
+        axis.errorbar(
+            group.n_options, group.point,
+            # a percentile bootstrap interval need not contain the point estimate
+            yerr=np.clip([group.point - group.low, group.high - group.point], 0, None),
+            color=CONDITION_COLOR[first.condition], marker="o", capsize=ERROR_CAP_SIZE,
+            linestyle=FAMILY_DASH.get(first.family, "-"),
+            label=series_label(first, varying)
+            + suffix.format(int(first.n_seeds),
+                            METHOD_PHRASE.get(first.method, first.method)),
+        )
+    axis.set_xscale("log", base=2)
+    axis.set_xticks(sorted(table.n_options.unique()))
+    axis.xaxis.set_major_formatter(ScalarFormatter())
+    axis.set_xlabel("options in the catalogue")
+    axis.set_ylabel(f"episodic return, final {data.args.tail:.0%} of each seed")
+    finish(figure, [axis], environments(frame), caption_for(table, varying))
+    return figure, table
+
+def duration_vs_cap(data: Inputs) -> Tuple[Figure, pd.DataFrame]:
+    """Measured option durations against the table's cap, per cell."""
+    # not the requested histogram: per-decision durations are never stored, only means
+    # and duration_stats' largest lane, which is the only saturation statistic there is
+    columns = tuple(column for column, _, _ in DURATION_MARKERS)
+    table = require_columns(data.meta, columns + ("max_option_len",), "duration")
+    table = table[table.condition != "action"].copy()
+    if table.empty:
+        raise MissingData("duration_vs_cap found no option cells")
+    caps = table.max_option_len.unique()
+    if caps.size < 2:
+        raise MissingData(f"every loaded cell caps options at {caps[0]:g} primitive steps, "
+                          "so there is nothing to compare")
+    table["saturation"] = table.duration_max_lane_max / table.max_option_len
+    table = table.sort_values(["n_options", "family", "cell"])
+
+    at = np.arange(len(table))
+    prefix = common_group(table.cell)
+    figure, axis = plt.subplots(figsize=(FIGURE_SIZE[0], 2.0 + ROW_HEIGHT * len(table)))
+    axis.scatter(table.max_option_len, at, marker="|", s=CAP_MARKER_SIZE, color="black",
+                 label="cap")
+    for column, label, marker in DURATION_MARKERS:
+        axis.scatter(table[column], at, marker=marker, label=label)
+    axis.set_yticks(at)
+    axis.set_yticklabels([short(name, prefix) for name in table.cell], fontsize=SMALL_FONT)
+    axis.set_xlabel("primitive steps per option")
+    axis.set_xlim(left=0)
+    finish(figure, [axis], "realised option duration against the cap",
+           caption_for(table, varying_fields(table)))
+    return figure, table
+
+def option_usage(data: Inputs) -> Tuple[Figure, pd.DataFrame]:
+    """Blocked: nothing in the store records which option index was selected."""
+    raise MissingData(
+        "no per-option selection counts exist: ppo.py would need a bincount over "
+        "experience.action, and Results.append keeps only ndim==2 logs"
+    )
+
+def threshold_table(data: Inputs) -> Tuple[Figure, pd.DataFrame]:
+    """Primitive steps to reach the return threshold, as a rendered table."""
+    frame = require_columns(data.episodes, ("primitive_step", "episodic_return"), "threshold")
+    table = steps_to_threshold(data, frame, np.random.default_rng(BOOTSTRAP_SEED))
+    prefix = common_group(table.cell)
+    body = [
+        [short(str(row.cell), prefix),
+         "-" if np.isnan(row.point) else f"{row.point:,.0f}",
+         "-" if np.isnan(row.low) else f"[{row.low:,.0f}, {row.high:,.0f}]",
+         f"{row.n_crossed}/{row.n_seeds}", row.method]
+        for row in table.itertuples()
+    ]
+    height = 1.0 + ROW_HEIGHT * (len(body) + 1)
+    figure, axis = plt.subplots(figsize=(FIGURE_SIZE[0], height))
+    axis.axis("off")
+    # bbox, not loc: `loc` centres a table sized to its text, leaving the figure
+    # mostly blank, and the cell column is then clipped rather than widened
+    rendered = axis.table(cellText=body, cellLoc="left", bbox=[0.0, 0.0, 1.0, 1.0],
+                          colLabels=["cell", "steps", "interval", "crossed", "method"])
+    rendered.auto_set_font_size(False)
+    rendered.auto_set_column_width(range(len(body[0])))
+    rendered.set_fontsize(SMALL_FONT)
+    # one value: a group is one environment and one tag, which is what a threshold is by
+    figure.suptitle(f"primitive steps to episodic return {table.threshold.iloc[0]:g} "
+                    f"({data.args.window}-episode moving average)")
+    figure.tight_layout()
+    return figure, table
+
+
+FIGURES: Dict[str, Callable[[Inputs], Tuple[Figure, pd.DataFrame]]] = {
+    "return_curve": return_curve,
+    "success_curve": success_curve,
+    "length_curve": length_curve,
+    "option_count_sweep": option_count_sweep,
+    "family_overlay": family_overlay,
+    "duration_vs_cap": duration_vs_cap,
+    "option_usage": option_usage,
+    "threshold_table": threshold_table,
+}
+
+DISABLED = frozenset({"option_usage"})
+"""Registered but not drawn unless named; each raises `MissingData` saying why."""
+
+def selected(args: argparse.Namespace) -> List[str]:
+    """The registry entries to attempt, in registry order."""
+    unknown = (set(args.only or []) | set(args.skip or [])) - set(FIGURES)
+    if unknown:
+        raise SystemExit(f"unknown figures: {', '.join(sorted(unknown))}")
+    return [name for name in FIGURES
+            if (name in args.only if args.only else name not in DISABLED)
+            and name not in (args.skip or [])]
+
+def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    """Parse the command line."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--cells", nargs="*", default=["*"], help="globs, e.g. '*__hard'")
+    parser.add_argument("--only", nargs="*", help=f"figures from: {', '.join(FIGURES)}")
+    parser.add_argument("--skip", nargs="*", help="figures to leave out")
+    parser.add_argument("--format", default="png", choices=("svg", "pdf","png"))
+    parser.add_argument("--bins", type=int, default=200)
+    parser.add_argument("--window", type=int, default=100)
+    parser.add_argument("--tail", type=float, default=0.1)
+    parser.add_argument("--threshold", type=float,
+                        help=f"overrides the sweep's, default {DEFAULT_THRESHOLD:g}")
+    parser.add_argument("--resamples", type=int, default=2000)
+    return parser.parse_args(argv)
+
+def group_keys(frame: pd.DataFrame) -> List[str]:
+    """The run groups present in `frame`."""
+    return [] if frame.empty else [str(name) for name in frame["group"].unique()]
+
+def slice_of(frame: pd.DataFrame, group: str) -> pd.DataFrame:
+    """The rows of `frame` belonging to one run group."""
+    return frame if frame.empty else frame[frame["group"] == group]
+
+def draw_group(names: Sequence[str], data: Inputs, directory: pathlib.Path) -> int:
+    """Draw the named figures for one group, returning how many were written."""
+    csv_directory = directory / "csv"
+    csv_directory.mkdir(parents=True, exist_ok=True)
+    # ahead of the figures, and unconditionally: the measured durations convert the budget
+    # into decisions whether or not `duration_vs_cap` had two caps to draw
+    if not data.meta.empty:
+        data.meta.to_csv(csv_directory / "duration.csv", index=False)
+    written = 0
+    for name in names:
+        try:
+            figure, table = FIGURES[name](data)
+        except MissingData as error:
+            print(f"  skipping {name}: {error}")
+            continue
+        # bbox_inches: long cell names on a categorical axis overrun a fixed canvas
+        figure.savefig(directory / f"{name}.{data.args.format}", bbox_inches="tight")
+        plt.close(figure)
+        table.to_csv(csv_directory / f"{name}.csv", index=False)
+        written += 1
+        truncated = (f", truncated at {limit_span(table)} primitive steps"
+                     if "limit" in table.columns else "")
+        print(f"  wrote {name}.{data.args.format} and csv/{name}.csv{truncated}")
+    return written
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Draw every selected figure for each run group of the store."""
+    args = parse_arguments(argv)
+    names = selected(args)
+    if not names:
+        print("no figures selected")
+        return 1
+
+    loaded = []
+    for loader in (load_episodes, load_meta):
+        try:
+            loaded.append(loader(args.cells))
+        except MissingData as error:
+            warn(str(error))
+            loaded.append(pd.DataFrame())
+    episodes, meta = loaded
+
+    keys = sorted(set(group_keys(episodes)) | set(group_keys(meta)))
+    written = attempted = 0
+    for group in keys:
+        directory = PLOTS / short(group)
+        print(f"{directory.name}:")
+        data = Inputs(slice_of(episodes, group), slice_of(meta, group), args)
+        written += draw_group(names, data, directory)
+        attempted += len(names)
+
+    print(f"\n{written}/{attempted} figures written under {PLOTS}")
+    return 0 if written else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

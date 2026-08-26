@@ -69,6 +69,9 @@ class Sweep:
     families: Tuple[str, ...] = ("random", "grammar")
     n_options: Tuple[int, ...] = (8, 16, 32, 64, 128)
     seeds: Tuple[int, ...] = (0, 1, 2)
+    threshold: Optional[float] = None
+    """episodic return plot.py times the crossing of, where this environment's
+    asymptote puts its own default out of reach"""
 
 
 ANALYSIS_SEEDS: Tuple[int, ...] = tuple(range(10))
@@ -91,22 +94,24 @@ SWEEPS: Dict[str, Sweep] = {
     # n=64, not 128: at max_forward=4 the catalogue is 128 rows, so at n=128
     # `random.sample` returns the whole catalogue and the two families coincide
     "exp3": Sweep(
-        Args(max_forward=4, tag="exp3"),
+        Args(max_forward=4, tag="exp3", option_seed=(0, 1, 2, 3, 4)),
         conditions=("option",),
         families=("random", "grammar"),
         n_options=(64,),
         seeds=ANALYSIS_SEEDS,
     ),
-    # reach 4 covers proportionally less of a 16x16 map, and holding the slack
-    # ratio over a longer solution needs a longer truncation
-    "hard": Sweep(
+    # exp1 with the environment pinned rather than inherited from Args, and with the
+    # threshold it takes: return here asymptotes near 0.25, so 0.5 censors every cell
+    "exp1_16x16_Random": Sweep(
         Args(
-            env_id="Navix-DoorKey-16x16-v0",
-            max_forward=8,
-            max_steps=1000,
-            tag="hard",
+            env_id="Navix-DoorKey-Random-16x16-v0",
+            max_forward=4,
+            tag="exp1_16x16_Random",
         ),
+        families=("grammar",),
         n_options=(64,),
+        seeds=ANALYSIS_SEEDS,
+        threshold=0.15,
     ),
     "long-baseline": Sweep(
         Args(max_forward=4, budget=3_000_000, tag="long-baseline-3M"),
@@ -118,6 +123,13 @@ SWEEPS: Dict[str, Sweep] = {
     seeds=tuple(range(10))
     ),
 }
+
+THRESHOLDS: Dict[Tuple[str, str], float] = {
+    (sweep.base.env_id, sweep.base.tag): sweep.threshold
+    for sweep in SWEEPS.values()
+    if sweep.threshold is not None
+}
+"""What plot.py reads a declared threshold by: the pair a run group's name is built from."""
 
 
 @dataclass(frozen=True)

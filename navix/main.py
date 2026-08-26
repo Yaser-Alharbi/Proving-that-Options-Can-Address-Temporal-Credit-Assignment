@@ -79,29 +79,13 @@ ANALYSIS_SEEDS: Tuple[int, ...] = tuple(range(10))
 
 SWEEPS: Dict[str, Sweep] = {
     "exp1": Sweep(
+        Args(env_id="Navix-DoorKey-8x8-v0", tag="exp1"),
         Args(max_forward=4, tag="exp1"),
         families=("grammar",),
         n_options=(64,),
         seeds=ANALYSIS_SEEDS,
     ),
-    "exp2": Sweep(
-        Args(max_forward=4, tag="exp2"),
-        conditions=("action", "option"),
-        families=("grammar",),
-        n_options=(8, 16, 32, 64, 128),
-        seeds=ANALYSIS_SEEDS,
-    ),
-    # n=64, not 128: at max_forward=4 the catalogue is 128 rows, so at n=128
-    # `random.sample` returns the whole catalogue and the two families coincide
-    "exp3": Sweep(
-        Args(max_forward=4, tag="exp3", option_seed=(0, 1, 2, 3, 4)),
-        conditions=("option",),
-        families=("random", "grammar"),
-        n_options=(64,),
-        seeds=ANALYSIS_SEEDS,
-    ),
-    # exp1 with the environment pinned rather than inherited from Args, and with the
-    # threshold it takes: return here asymptotes near 0.25, so 0.5 censors every cell
+    
     "exp1_16x16_Random": Sweep(
         Args(
             env_id="Navix-DoorKey-Random-16x16-v0",
@@ -112,6 +96,56 @@ SWEEPS: Dict[str, Sweep] = {
         n_options=(64,),
         seeds=ANALYSIS_SEEDS,
         threshold=0.15,
+    ),
+    "exp1_16x16": Sweep(
+        Args(
+            env_id="Navix-DoorKey-16x16-v0",
+            max_forward=4,
+            tag="exp1_16x16",
+        ),
+        families=("grammar",),
+        n_options=(64,),
+        seeds=ANALYSIS_SEEDS,
+        threshold=0.15,
+    ),
+    "exp2": Sweep(
+        Args(max_forward=4, tag="exp2"),
+        conditions=("action", "option", "both"),
+        families=("grammar",),
+        n_options=(8, 16, 32, 64, 128),
+        seeds=ANALYSIS_SEEDS,
+    ),
+    "exp2_16x16": Sweep(
+        Args(
+            env_id="Navix-DoorKey-16x16-v0",
+            max_forward=8,
+            tag="exp2_16x16",
+        ),
+        conditions=("action", "option", "both"),
+        families=("grammar",),
+        n_options=(8, 16, 32, 64, 128, 256),
+        seeds=ANALYSIS_SEEDS,
+        threshold=0.1,
+    ),
+    "exp2_16x16_Random": Sweep(
+        Args(
+            env_id="Navix-DoorKey-Random-16x16-v0",
+            max_forward=8,  
+            tag="exp2_16x16_Random",  
+        ),
+        conditions=("action", "option", "both"),
+        families=("grammar",),
+        n_options=(8, 16, 32, 64, 128, 256),
+        seeds=ANALYSIS_SEEDS,
+    ),
+    # n=64, not 128: at max_forward=4 the catalogue is 128 rows, so at n=128
+    # `random.sample` returns the whole catalogue and the two families coincide
+    "exp3": Sweep(
+        Args(max_forward=4, tag="exp3", option_seed=(0, 1, 2, 3, 4)),
+        conditions=("option",),
+        families=("random", "grammar"),
+        n_options=(64,),
+        seeds=ANALYSIS_SEEDS,
     ),
     "long-baseline": Sweep(
         Args(max_forward=4, budget=3_000_000, tag="long-baseline-3M"),

@@ -69,6 +69,13 @@ CONDITION_LABEL: Dict[str, str] = {
 }
 FAMILY_DASH: Dict[str, str] = {"grammar": "-", "random": "--"}
 
+COUNT_COLORMAP = "viridis"
+COUNT_COLOR_RANGE = (0.15, 0.9)
+"""Ends trimmed off the ramp: its pale tail is invisible on white."""
+
+BASELINE_DASH = "--"
+"""How the action baseline is drawn where colour is spent on catalogue size."""
+
 SERIES_KEYS: Tuple[str, ...] = (
     "env_id", "condition", "family", "option_seed", "budget", "max_forward", "max_steps",
     "reward_delay", "gamma", "discount", "executor", "tag",
@@ -119,14 +126,9 @@ def warn(message: str) -> None:
     """Print a non-fatal problem with the store."""
     print(f"  warning: {message}")
 
-def short(name: str, prefix: str = "") -> str:
-    """A name without `prefix` or the environment boilerplate, for ticks and legends."""
-    return name.removeprefix(prefix).replace("Navix-", "").replace("-v0", "")
-
-def common_group(names: Iterable[str]) -> str:
-    """The `{group}/` prefix every cell name in `names` shares, or an empty string."""
-    groups = {str(name).split("/")[0] for name in names}
-    return f"{groups.pop()}/" if len(groups) == 1 else ""
+def short(name: str) -> str:
+    """A name without the environment boilerplate, for ticks and legends."""
+    return name.replace("Navix-", "").replace("-v0", "")
 
 def cell_directories(patterns: Sequence[str]) -> List[pathlib.Path]:
     """Every cell directory under a group whose store-relative name matches one of `patterns`."""
@@ -424,22 +426,29 @@ def caption_for(table: pd.DataFrame, varying: Sequence[str],
         ", ".join(fixed), ", ".join(filter(None, [shared_estimate(table), *extra])),
     ]))
 
-def draw_bands(axis: Axes, table: pd.DataFrame, varying: Sequence[str]) -> None:
-    """One line and interval band per cell, coloured by condition."""
+def draw_bands(axis: Axes, table: pd.DataFrame, varying: Sequence[str],
+               colors: Optional[Dict[int, Tuple[float, float, float, float]]] = None) -> None:
+    """One line and interval band per cell, coloured by condition, or by `colors` if given.
+
+    Under `colors`, an option cell takes the colour of its catalogue size and is named by
+    it alone; the action cell keeps its condition colour and is dashed, as a reference.
+    """
     # the seed count and method go in the caption where every cell agrees, which is the
     # usual case, and stay on the entry where a short cell fell back to median-and-range
     suffix = "" if shared_estimate(table) else " ({} seeds, {})"
     # sorted by what the legend prints, so `n=8` precedes `n=16`; grouping by the cell name
     # alone orders the legend lexically, and sort=False then keeps this order
-    conditions = list(CONDITION_LABEL)
     order = [*dict.fromkeys(["_condition_at", *varying]), "cell"]
-    ordered = table.assign(_condition_at=table.condition.map(conditions.index))
+    ordered = table.assign(_condition_at=table.condition.map(list(CONDITION_LABEL).index))
     for _, group in ordered.sort_values(order).groupby("cell", sort=False):
         first = group.iloc[0]
-        color = CONDITION_COLOR[first.condition]
+        counted = colors is not None and first.condition != "action"
+        color = colors[int(first.n_options)] if counted else CONDITION_COLOR[first.condition]
         axis.plot(group.primitive_step, group.point, color=color, linewidth=LINE_WIDTH,
-                  linestyle=FAMILY_DASH.get(first.family, "-"),
-                  label=series_label(first, varying)
+                  linestyle=FAMILY_DASH.get(first.family, "-") if colors is None
+                  else ("-" if counted else BASELINE_DASH),
+                  label=f"n={first.n_options:g}" if counted else
+                  series_label(first, varying)
                   + suffix.format(int(first.n_seeds),
                                   METHOD_PHRASE.get(first.method, first.method)))
         axis.fill_between(group.primitive_step, group.low, group.high, color=color,
@@ -613,6 +622,47 @@ def family_overlay(data: Inputs) -> Tuple[Figure, pd.DataFrame]:
            caption_for(combined, varying, (f"{data.args.window}-episode moving average",)))
     return figure, combined
 
+def count_overlay(data: Inputs) -> Tuple[Figure, pd.DataFrame]:
+    """Return curves, one panel per condition, coloured by catalogue size."""
+    frame = require_columns(data.episodes,
+                            ("primitive_step", "episodic_return", "n_options"), "overlay")
+    # one aggregation for the whole frame, then split: a call per panel would bootstrap the
+    # action cell again off a mutated rng and give one cell a different band in each panel
+    combined = aggregate_curve(data, frame, "episodic_return",
+                               np.random.default_rng(BOOTSTRAP_SEED))
+    conditions = [condition for condition in CONDITION_LABEL
+                  if condition != "action" and condition in set(combined.condition)]
+    if not conditions:
+        raise MissingData("no option cell has a span every one of its seeds covers")
+    counts = sorted({int(n) for n in combined.loc[combined.condition != "action", "n_options"]})
+    if len(counts) < 2:
+        raise MissingData("count_overlay needs at least two catalogue sizes; every "
+                          f"drawable option cell is n={counts[0]}")
+
+    low, high = COUNT_COLOR_RANGE
+    colormap = matplotlib.colormaps[COUNT_COLORMAP]
+    colors = {count: colormap(low + (high - low) * position / max(len(counts) - 1, 1))
+              for position, count in enumerate(counts)}
+    reference = combined[combined.condition == "action"]
+    varying = varying_fields(combined)
+
+    # never narrower than a single-axis figure, which is what the caption is sized for
+    figure, axes = plt.subplots(
+        1, len(conditions), sharey=True, squeeze=False,
+        figsize=(max(FIGURE_SIZE[0], PANEL_WIDTH * len(conditions)), FIGURE_SIZE[1]),
+    )
+    for axis, condition in zip(axes[0], conditions):
+        panel = pd.concat([reference, combined[combined.condition == condition]],
+                          ignore_index=True)
+        draw_bands(axis, panel, varying, colors)
+        axis.set_title(CONDITION_LABEL[condition])
+        axis.set_xlabel(X_LABEL)
+    apply_x_scale(list(axes[0]), combined)
+    axes[0][0].set_ylabel("episodic return")
+    finish(figure, list(axes[0]), environments(frame),
+           caption_for(combined, varying, (f"{data.args.window}-episode moving average",)))
+    return figure, combined
+
 def option_count_sweep(data: Inputs) -> Tuple[Figure, pd.DataFrame]:
     """Final return against catalogue size, one series per otherwise-equal cell."""
     frame = require_columns(data.episodes, ("episodic_return", "n_options"), "sweep")
@@ -675,20 +725,23 @@ def duration_vs_cap(data: Inputs) -> Tuple[Figure, pd.DataFrame]:
                           "so there is nothing to compare")
     table["saturation"] = table.duration_max_lane_max / table.max_option_len
     table = table.sort_values(["n_options", "family", "cell"])
+    varying = varying_fields(table)
 
     at = np.arange(len(table))
-    prefix = common_group(table.cell)
     figure, axis = plt.subplots(figsize=(FIGURE_SIZE[0], 2.0 + ROW_HEIGHT * len(table)))
     axis.scatter(table.max_option_len, at, marker="|", s=CAP_MARKER_SIZE, color="black",
                  label="cap")
     for column, label, marker in DURATION_MARKERS:
         axis.scatter(table[column], at, marker=marker, label=label)
     axis.set_yticks(at)
-    axis.set_yticklabels([short(name, prefix) for name in table.cell], fontsize=SMALL_FONT)
+    # what separates this cell from the others, as in a legend entry; everything the rows
+    # share is in the caption, so the cell name would repeat it on every tick
+    axis.set_yticklabels([series_label(row, varying) for _, row in table.iterrows()],
+                         fontsize=SMALL_FONT)
     axis.set_xlabel("primitive steps per option")
     axis.set_xlim(left=0)
     finish(figure, [axis], "realised option duration against the cap",
-           caption_for(table, varying_fields(table)))
+           caption_for(table, varying))
     return figure, table
 
 def option_usage(data: Inputs) -> Tuple[Figure, pd.DataFrame]:
@@ -702,13 +755,15 @@ def threshold_table(data: Inputs) -> Tuple[Figure, pd.DataFrame]:
     """Primitive steps to reach the return threshold, as a rendered table."""
     frame = require_columns(data.episodes, ("primitive_step", "episodic_return"), "threshold")
     table = steps_to_threshold(data, frame, np.random.default_rng(BOOTSTRAP_SEED))
-    prefix = common_group(table.cell)
+    varying = varying_fields(table)
+    # what separates this cell from the others, as in a legend entry; everything the rows
+    # share is in the caption, so the cell name would repeat it on every row
     body = [
-        [short(str(row.cell), prefix),
+        [series_label(row, varying),
          "-" if np.isnan(row.point) else f"{row.point:,.0f}",
          "-" if np.isnan(row.low) else f"[{row.low:,.0f}, {row.high:,.0f}]",
          f"{row.n_crossed}/{row.n_seeds}", row.method]
-        for row in table.itertuples()
+        for _, row in table.iterrows()
     ]
     height = 1.0 + ROW_HEIGHT * (len(body) + 1)
     figure, axis = plt.subplots(figsize=(FIGURE_SIZE[0], height))
@@ -724,6 +779,9 @@ def threshold_table(data: Inputs) -> Tuple[Figure, pd.DataFrame]:
     figure.suptitle(f"primitive steps to episodic return {table.threshold.iloc[0]:g} "
                     f"({data.args.window}-episode moving average)")
     figure.tight_layout()
+    caption = caption_for(table, varying)
+    if caption:
+        figure.text(1.0, 1.0, caption, ha="right", va="top", fontsize=SMALL_FONT)
     return figure, table
 
 
@@ -733,6 +791,7 @@ FIGURES: Dict[str, Callable[[Inputs], Tuple[Figure, pd.DataFrame]]] = {
     "length_curve": length_curve,
     "option_count_sweep": option_count_sweep,
     "family_overlay": family_overlay,
+    "count_overlay": count_overlay,
     "duration_vs_cap": duration_vs_cap,
     "option_usage": option_usage,
     "threshold_table": threshold_table,
@@ -743,7 +802,7 @@ DISABLED = frozenset({"option_usage"})
 
 EXPERIMENT_FIGURES: Dict[str, Tuple[str, ...]] = {
     "exp1": ("return_curve", "threshold_table", "length_curve"),
-    "exp2": ("option_count_sweep", "return_curve"),
+    "exp2": ("option_count_sweep", "threshold_table", "count_overlay"),
     "exp3": ("family_overlay", "return_curve", "threshold_table"),
 }
 """What each experiment's tag is there to show; an untagged or unknown group draws

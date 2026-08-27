@@ -1,7 +1,7 @@
 """Tests for the aggregation core of `plot.py`, on hand-built inputs."""
 
 import argparse
-from typing import Dict, List
+from typing import Dict, List, Sequence, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -10,10 +10,13 @@ import pytest
 
 from matplotlib.colors import to_rgb
 from plot import (
+    BASE_DELAY,
+    CENSOR_FRACTION,
     CONDITION_COLOR,
     CONDITION_LABEL,
     GRAMMAR_COLOR,
     MIN_SEEDS_FOR_IQM,
+    NO_INTERACTION,
     Inputs,
     MissingData,
     apply_x_scale,
@@ -21,7 +24,12 @@ from plot import (
     collinear,
     count_overlay,
     crossing_step,
+    delay_advantage,
+    delay_crossing_fraction,
+    delay_slack,
+    delay_sweep,
     duration_vs_cap,
+    duration_vs_delay,
     estimate,
     iqm,
     return_curve,
@@ -38,6 +46,25 @@ CROSSING_STEP = 400
 GRID_POINTS = len(np.arange(0, LAST_STEP + 1, GRID_STEP))
 SETTLE_POINTS = 100
 CLIMB_POINTS = 10
+
+DELAY_SEEDS = MIN_SEEDS_FOR_IQM
+"""Enough seeds for the bootstrap branch, so a figure's method matches the real runs."""
+
+DELAY_DELAYS: Tuple[int, ...] = (0, 32)
+DELAY_MAX_STEPS = 400
+DELAY_DISCOUNTS: Tuple[str, ...] = ("decision", "primitive")
+DELAY_TAIL = 0.1
+
+CROSSING_AT: Dict[Tuple[str, int], int] = {
+    ("action", 0): 100, ("action", 32): 200,
+    ("option", 0): 100, ("option", 32): 100,
+}
+"""Steps to the threshold: action degrades with delay, option does not."""
+
+SOLVE_LENGTH: Dict[str, int] = {"action": 380, "option": 100}
+"""Primitive steps to the goal, chosen so action at delay 32 pins at `DELAY_MAX_STEPS`."""
+
+OPTION_DURATION: Dict[str, float] = {"action": 1.0, "option": 4.0}
 
 
 def one_stratum(n_seeds: int) -> np.ndarray:
@@ -109,6 +136,51 @@ def draw_episodes() -> pd.DataFrame:
         })
         for family, option_seed in cells for seed in range(2)
     ], ignore_index=True)
+
+def delay_episodes() -> pd.DataFrame:
+    """Both conditions at two delays under both discount modes, every seed identical.
+
+    Identical seeds make each point estimate exact and collapse its interval onto it, so a
+    figure can be asserted against arithmetic rather than against a bootstrap draw.
+    """
+    steps = np.arange(0, LAST_STEP + 1, GRID_STEP)
+    frames = []
+    for discount in DELAY_DISCOUNTS:
+        for condition in ("action", "option"):
+            for delay in DELAY_DELAYS:
+                solved = np.where(steps >= CROSSING_AT[(condition, delay)], 1.0, 0.0)
+                length = min(SOLVE_LENGTH[condition] + delay, DELAY_MAX_STEPS)
+                frames += [
+                    pd.DataFrame({
+                        "cell": f"group/{discount}-{condition}-d{delay}", "group": "group",
+                        "env_id": "env", "condition": condition,
+                        "family": "-" if condition == "action" else "grammar",
+                        "n_options": 0 if condition == "action" else 64,
+                        "option_seed": 0, "tag": "exp4", "seed": seed,
+                        "primitive_step": steps, "episodic_return": solved,
+                        "episodic_length": length, "terminated": solved.astype(int),
+                        "max_steps": DELAY_MAX_STEPS, "reward_delay": delay,
+                        "discount": discount,
+                        "mean_option_duration": OPTION_DURATION[condition],
+                    })
+                    for seed in range(DELAY_SEEDS)
+                ]
+    return pd.concat(frames, ignore_index=True)
+
+def delay_args() -> argparse.Namespace:
+    """Options a delay figure reads, with smoothing switched off."""
+    return argparse.Namespace(bins=GRID_POINTS, window=1, threshold=0.5,
+                              resamples=RESAMPLES, tail=DELAY_TAIL)
+
+def without_crossings(frame: pd.DataFrame, condition: str, delay: int,
+                      seeds: Sequence[int]) -> pd.DataFrame:
+    """`frame` with the named seeds of one condition and delay never reaching the threshold."""
+    frame = frame.copy()
+    target = ((frame.condition == condition) & (frame.reward_delay == delay)
+              & frame.seed.isin(list(seeds)))
+    frame.loc[target, ["episodic_return", "terminated"]] = 0
+    return frame
+
 
 def settle_steps() -> np.ndarray:
     """The x positions the curves in `curve_table` are sampled at."""
@@ -328,6 +400,86 @@ def test_return_curve_colours_lines_by_draw() -> None:
     for line, collection in zip(axis.lines, axis.collections):
         assert to_rgb(collection.get_facecolor()[0]) == pytest.approx(to_rgb(line.get_color()))
     plt.close(figure)
+
+def test_delay_crossing_fraction_marks_the_censoring_rule() -> None:
+    """The fraction is crossing seeds over all seeds, drawn against the rule the table censors by."""
+    frame = without_crossings(delay_episodes(), "action", 32, range(4, DELAY_SEEDS))
+    figure, table = delay_crossing_fraction(Inputs(frame, pd.DataFrame(), delay_args()))
+    assert (table.crossed_fraction == table.n_crossed / table.n_seeds).all()
+    thinned = table[(table.condition == "action") & (table.reward_delay == 32)]
+    assert set(thinned.crossed_fraction) == {CENSOR_FRACTION}
+    # exactly on the rule, so the cell is reported rather than censored
+    assert thinned.point.notna().all()
+    for axis in figure.get_axes():
+        rule = [line for line in axis.lines
+                if "censoring rule" in str(line.get_label())]
+        assert [line.get_ydata()[0] for line in rule] == [CENSOR_FRACTION]
+    plt.close(figure)
+
+def test_delay_slack_separates_compression_from_the_solve_length() -> None:
+    """Row one is `episodic_length - delay` against a `max_steps - delay` line, row two the pinned solves."""
+    figure, table = delay_slack(Inputs(delay_episodes(), pd.DataFrame(), delay_args()))
+    keyed = table.set_index(["condition", "discount", "reward_delay"])
+    assert keyed.loc[("action", "decision", 0), "point"] == pytest.approx(
+        SOLVE_LENGTH["action"]
+    )
+    # 380 + 32 overruns max_steps, so the delay is compressed to 20 and the implied solve
+    # length reads 368 rather than the 380 the episode actually took
+    assert keyed.loc[("action", "decision", 32), "point"] == pytest.approx(
+        DELAY_MAX_STEPS - 32
+    )
+    assert keyed.loc[("action", "decision", 0), "pinned_point"] == pytest.approx(0.0)
+    assert keyed.loc[("action", "decision", 32), "pinned_point"] == pytest.approx(1.0)
+    option = table[table.condition == "option"]
+    assert option.point.to_numpy() == pytest.approx(SOLVE_LENGTH["option"])
+    assert option.pinned_point.to_numpy() == pytest.approx(0.0)
+    reference = next(line for line in figure.get_axes()[0].lines
+                     if str(line.get_label()) == "max_steps − delay")
+    assert list(reference.get_ydata()) == pytest.approx(
+        [DELAY_MAX_STEPS - delay for delay in DELAY_DELAYS]
+    )
+    plt.close(figure)
+
+def test_delay_sweep_leaves_a_gap_where_a_cell_is_censored() -> None:
+    """A censored cell keeps its row but is not drawn, so the line stops rather than dipping."""
+    frame = without_crossings(delay_episodes(), "action", 32, range(1, DELAY_SEEDS))
+    figure, table = delay_sweep(Inputs(frame, pd.DataFrame(), delay_args()))
+    censored = table[(table.condition == "action") & (table.reward_delay == 32)]
+    assert (censored.method == "censored").all()
+    assert censored.point.isna().all()
+    for axis in figure.get_axes():
+        # an errorbar labels its container, not the Line2D, which stays `_nolegend_`
+        drawn = {str(series.get_label()): list(series.lines[0].get_xdata())
+                 for series in axis.containers}
+        assert drawn[CONDITION_LABEL["action"]] == [BASE_DELAY]
+        assert drawn[CONDITION_LABEL["option"]] == list(DELAY_DELAYS)
+    plt.close(figure)
+
+def test_delay_advantage_is_exactly_one_at_the_base_delay() -> None:
+    """Normalising inside the replicate pins the base delay to one with no interval around it."""
+    figure, table = delay_advantage(Inputs(delay_episodes(), pd.DataFrame(), delay_args()))
+    base = table[table.reward_delay == BASE_DELAY]
+    for column in ("point", "low", "high"):
+        assert base[column].to_numpy() == pytest.approx(NO_INTERACTION)
+    delayed = table[table.reward_delay == 32]
+    ratio = CROSSING_AT[("action", 32)] / CROSSING_AT[("option", 32)]
+    assert delayed.ratio.to_numpy() == pytest.approx(ratio)
+    # the base ratio is one here, so the normalised point is the raw ratio
+    assert delayed.point.to_numpy() == pytest.approx(ratio)
+    assert set(table.discount) == set(DELAY_DISCOUNTS)
+    plt.close(figure)
+
+def test_duration_vs_delay_excludes_the_action_condition() -> None:
+    """An action cell takes one primitive step per decision, so only option cells are drawn."""
+    figure, table = duration_vs_delay(Inputs(delay_episodes(), pd.DataFrame(), delay_args()))
+    assert set(table.condition) == {"option"}
+    assert table.point.to_numpy() == pytest.approx(OPTION_DURATION["option"])
+    for axis in figure.get_axes():
+        assert [str(series.get_label()) for series in axis.containers] == [
+            CONDITION_LABEL["option"]
+        ]
+    plt.close(figure)
+
 
 def test_settled_steps_ignores_a_curve_that_never_moved() -> None:
     """A cell flat at its floor never learned, so it is not a curve that settled."""

@@ -33,6 +33,8 @@ _DEFAULT_ARGS = Args() # default arguments for `Cell.name`.
 
 _NAMED_IF_NONDEFAULT = ("budget", "max_forward", "max_steps", "gamma", "discount", "executor", "reward_delay") # fields appended to `Cell.name` if non-default.
 
+_STRING_TUPLE_FIELDS = ("conditions", "families", "discounts") # `Sweep` axes whose elements are strings.
+
 
 def cell_name(directory: pathlib.Path) -> str:
     """A cell's store-relative name, `{group}/{cell}`."""
@@ -78,6 +80,17 @@ class Sweep:
     """empty uses `base.reward_delay`, so a sweep that does not name this stays one cell"""
     discounts: Tuple[str, ...] = ()
     gammas: Tuple[float, ...] = ()
+
+    def __post_init__(self) -> None:
+        """Reject a bare string where a tuple of strings is meant."""
+        for field_name in _STRING_TUPLE_FIELDS:
+            value = getattr(self, field_name)
+            # a string is iterable, so `expand` would silently take its characters
+            # for the axis; the numeric axes reach `itertools.product` and raise
+            assert not isinstance(value, str), (
+                f"{field_name}={value!r} is a string, not a tuple: a "
+                "single-element tuple needs its trailing comma"
+            )
 
 
 ANALYSIS_SEEDS: Tuple[int, ...] = tuple(range(10))
@@ -169,7 +182,7 @@ SWEEPS: Dict[str, Sweep] = {
     ),
     "exp4_probe": Sweep(
     Args(
-        env_id="Navix-DoorKey-8x8-v0", #env_id="Navix-KeyCorridorS6R3-v0"
+        env_id="Navix-KeyCorridorS6R3-v0", #env_id="Navix-KeyCorridorS6R3-v0"
         max_steps=400,
         budget=1_000_000,
         tag="exp4_probe",
@@ -178,41 +191,26 @@ SWEEPS: Dict[str, Sweep] = {
     reward_delays=(0, 16, 32, 64),
     seeds=ANALYSIS_SEEDS,
 ),
-    "exp4_decision": Sweep(
+    # one sweep, so both discount arms land in one run group: plot.py slices its
+    # inputs per group, and a figure panelled by `discount` needs to see both
+    "exp4": Sweep(
         Args(
             env_id="Navix-DoorKey-Random-16x16-v0",
             max_forward=8,
-            max_steps=400,
+            max_steps=1200,
             budget=5_000_000,
             option_family="grammar",
             option_seed=0,
-            tag="exp4_decision",
-        ),
-        conditions=("option"),
-        families=("grammar",),
-        n_options=(64,),
-        reward_delays=(0, 8, 16, 32, 64),
-        discounts=("decision",),
-        seeds=ANALYSIS_SEEDS,
-        option_seeds=(0,),
-    ),
-    "exp4_primitive": Sweep(
-        Args(
-            env_id="Navix-DoorKey-Random-16x16-v0",
-            max_forward=8,
-            max_steps=400,
-            budget=5_000_000,
-            option_family="grammar",
-            option_seed=0,
-            tag="exp4_primitive",
+            tag="exp4",
         ),
         conditions=("action", "option"),
         families=("grammar",),
         n_options=(64,),
         reward_delays=(0, 8, 16, 32, 64),
-        discounts=("primitive",),
+        discounts=("decision", "primitive"),
         seeds=ANALYSIS_SEEDS,
         option_seeds=(0,),
+        threshold=0.15,
     ),
     "long-baseline": Sweep(
         Args(max_forward=4, budget=3_000_000, tag="long-baseline-3M"),

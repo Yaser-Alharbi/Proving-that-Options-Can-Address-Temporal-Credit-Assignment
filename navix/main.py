@@ -68,10 +68,16 @@ class Sweep:
     conditions: Tuple[str, ...] = ("action", "option", "both")
     families: Tuple[str, ...] = ("random", "grammar")
     n_options: Tuple[int, ...] = (8, 16, 32, 64, 128)
+    option_seeds: Tuple[int, ...] = (0,)
+    """draws of the `random` catalogue per count; `grammar` ignores the seed"""
     seeds: Tuple[int, ...] = (0, 1, 2)
     threshold: Optional[float] = None
     """episodic return plot.py times the crossing of, where this environment's
     asymptote puts its own default out of reach"""
+    reward_delays: Tuple[int, ...] = ()
+    """empty uses `base.reward_delay`, so a sweep that does not name this stays one cell"""
+    discounts: Tuple[str, ...] = ()
+    gammas: Tuple[float, ...] = ()
 
 
 ANALYSIS_SEEDS: Tuple[int, ...] = tuple(range(10))
@@ -79,13 +85,11 @@ ANALYSIS_SEEDS: Tuple[int, ...] = tuple(range(10))
 
 SWEEPS: Dict[str, Sweep] = {
     "exp1": Sweep(
-        Args(env_id="Navix-DoorKey-8x8-v0", tag="exp1"),
-        Args(max_forward=4, tag="exp1"),
+        Args(env_id="Navix-DoorKey-8x8-v0", tag="exp1", max_forward=4),
         families=("grammar",),
         n_options=(64,),
         seeds=ANALYSIS_SEEDS,
     ),
-    
     "exp1_16x16_Random": Sweep(
         Args(
             env_id="Navix-DoorKey-Random-16x16-v0",
@@ -141,11 +145,63 @@ SWEEPS: Dict[str, Sweep] = {
     # n=64, not 128: at max_forward=4 the catalogue is 128 rows, so at n=128
     # `random.sample` returns the whole catalogue and the two families coincide
     "exp3": Sweep(
-        Args(max_forward=4, tag="exp3", option_seed=(0, 1, 2, 3, 4)),
+        Args(max_forward=4, tag="exp3"),
         conditions=("option",),
         families=("random", "grammar"),
         n_options=(64,),
         seeds=ANALYSIS_SEEDS,
+        option_seeds=(0, 1, 2, 3, 4),
+    ),
+    "exp3_16x16_Random": Sweep(
+        Args(
+            env_id="Navix-DoorKey-Random-16x16-v0",
+            max_forward=8,
+            tag="exp3",
+            option_seed=0,
+            budget=5_000_000,
+        ),
+        conditions=("option",),
+        families=("random", "grammar"),
+        n_options=(64,),
+        option_seeds=(0, 1, 2, 3, 4),
+        seeds=ANALYSIS_SEEDS,
+        threshold=0.15,
+    ),
+    "exp4_decision": Sweep(
+        Args(
+            env_id="Navix-DoorKey-Random-16x16-v0",
+            max_forward=8,
+            max_steps=400,
+            budget=5_000_000,
+            option_family="grammar",
+            option_seed=0,
+            tag="exp4_decision",
+        ),
+        conditions=("action", "option"),
+        families=("grammar",),
+        n_options=(64,),
+        reward_delays=(0, 8, 16, 32, 64),
+        discounts=("decision",),
+        seeds=ANALYSIS_SEEDS,
+        option_seeds=(0,),
+    ),
+    "exp4_primitive": Sweep(
+        Args(
+            env_id="Navix-DoorKey-Random-16x16-v0",
+            max_forward=8,
+            max_steps=400,
+            budget=5_000_000,
+            option_family="grammar",
+            option_seed=0,
+            tag="exp4_primitive",
+        ),
+        conditions=("action", "option"),
+        families=("grammar",),
+        n_options=(64,),
+        reward_delays=(0, 8, 16, 32, 64),
+        discounts=("primitive",),
+        seeds=ANALYSIS_SEEDS,
+        option_seeds=(0,),
     ),
     "long-baseline": Sweep(
         Args(max_forward=4, budget=3_000_000, tag="long-baseline-3M"),
@@ -223,18 +279,42 @@ class Cell:
 
 
 def expand(sweep: Sweep) -> Iterator[Cell]:
-    """Every cell of a sweep: `action` once, the rest per family and count."""
+    """Every cell of a sweep: `action` once, the rest per family, count and draw.
+
+    An empty `reward_delays`, `discounts` or `gammas` uses the value on `base`.
+    """
+    delays = sweep.reward_delays or (sweep.base.reward_delay,)
+    modes = sweep.discounts or (sweep.base.discount,)
+    gammas = sweep.gammas or (sweep.base.gamma,)
     for condition in sweep.conditions:
         if condition == "action":
             variants: List[Dict[str, object]] = [{}]
         else:
-            variants = [
-                {"option_family": family, "n_options": count}
-                for family, count in itertools.product(sweep.families, sweep.n_options)
-            ]
-        for variant in variants:
+            variants = []
+            for family in sweep.families:
+                # the grammar catalogue is a function of n and max_forward alone,
+                # so drawing it once per option seed would repeat the same cell
+                seeds = (0,) if family == "grammar" else sweep.option_seeds
+                variants += [
+                    {
+                        "option_family": family,
+                        "n_options": count,
+                        "option_seed": option_seed,
+                    }
+                    for count, option_seed in itertools.product(sweep.n_options, seeds)
+                ]
+        for delay, mode, gamma, variant in itertools.product(
+            delays, modes, gammas, variants
+        ):
             yield Cell(
-                args=dataclasses.replace(sweep.base, action_space=condition, **variant),
+                args=dataclasses.replace(
+                    sweep.base,
+                    action_space=condition,
+                    reward_delay=delay,
+                    discount=mode,
+                    gamma=gamma,
+                    **variant,
+                ),
                 seeds=sweep.seeds,
             )
 

@@ -1,13 +1,12 @@
 # Copied from navix/agents/ppo.py (upstream, itself inspired by purejaxrl and
 # cleanrl) and edited in place. Deviations from upstream:
 #   - frames are counted in primitive steps, not decisions
-#   - Buffer carries t_next and d for primitive-step lengths and per-decision
-#     discounting
+#   - episode lengths and per-decision discounting are read off the option
+#     environment's info rather than off the timestep clock
 #   - num_updates divides the budget by the mean option duration
 #   - the policy over options is masked to the initiation sets containing s_t
-#   - episode_callback writes episodes.csv from the host
+#   - training is entered in chunks: `init` then repeated `run`
 from functools import partial
-import time
 from typing import Callable, Dict, Tuple
 
 import distrax
@@ -81,8 +80,6 @@ class Buffer(struct.PyTreeNode):
     log_prob: jax.Array
     obs: jax.Array
     info: Dict[str, jax.Array]
-    t: jax.Array
-    t_next: jax.Array
     step_type: jax.Array
     state: State
     # `info` above holds the post-step mask, so the one that actually gated
@@ -108,7 +105,28 @@ class PPO(Agent):
     hparams: PPOHparams
     network: ActorCritic = struct.field(pytree_node=False)
     env: Environment = None  # type: ignore[assignment]
-    episode_callback: Callable = struct.field(pytree_node=False, default=None)
+
+    @property
+    def num_updates(self) -> int:
+        """Updates the budget buys over the whole run, not over one chunk.
+
+        An estimate: the budget is in primitive steps and the duration a policy
+        draws drifts, so `frames` on the training state is the exact count.
+        """
+        updates = int(
+            self.hparams.budget
+            // (
+                self.hparams.num_steps
+                * self.hparams.num_envs
+                * self.hparams.mean_option_len
+            )
+        )
+        assert updates >= 1, (
+            f"budget {self.hparams.budget} buys less than one update of "
+            f"{self.hparams.num_steps * self.hparams.num_envs} decisions at "
+            f"{self.hparams.mean_option_len} primitive steps each"
+        )
+        return updates
 
     def collect_experience(
         self, train_state: TrainingState
@@ -136,8 +154,6 @@ class PPO(Agent):
                 log_prob=log_prob,  # log π(a_t|o_t)
                 obs=env_state.observation,  # o_t
                 info=new_env_state.info,  # info(o_{t+1})
-                t=env_state.t,  # t
-                t_next=new_env_state.t,  # t + duration, the episode length when done
                 step_type=new_env_state.step_type,  # 1 truncation, 2 termination
                 # the State carries the rendering cache, ~200KB per env, so
                 # keeping it for every transition costs num_steps * num_envs *
@@ -291,8 +307,6 @@ class PPO(Agent):
             // self.hparams.num_minibatches
         )
         # collect experience
-        frames_before = train_state.frames
-        decisions_before = train_state.decisions
         train_state, experience = self.collect_experience(train_state)
 
         for _ in range(self.hparams.num_epochs):
@@ -340,29 +354,62 @@ class PPO(Agent):
         # update logs with returns
         logs["done_mask"] = experience.done
         logs["returns"] = experience.info["return"]
-        # t_next, not t: at a done transition t is still the pre-step value, and
-        # the length has to be the primitive steps the episode actually took
-        logs["lengths"] = experience.t_next
+        # episode-local step count, not global timestep clock
+ 
+        logs["lengths"] = experience.info["episode_t"]
         logs["primitive_steps"] = experience.info["primitive_steps"]
+        # decisions elapsed in the episode; against `lengths` at a done
+        # transition this is the episode's mean realised option duration
+        logs["decision_t"] = experience.info["decision_t"]
+        # 1 truncation, 2 termination
+        logs["step_type"] = experience.step_type
+
+        # option diagnostics, read-only: what the executor did, not what it
+        # should have done. steps_max_lane is the per-decision worst env, which
+        # is what a vectorised while_loop actually waits for
+        logs["option/steps_mean"] = jnp.mean(experience.info["primitive_steps"])
+        logs["option/steps_max_lane"] = jnp.mean(
+            jnp.max(experience.info["primitive_steps"], axis=1)
+        )
+        logs["option/available_frac"] = jnp.mean(experience.info["available_frac"])
+        logs["option/interact_failed"] = jnp.mean(
+            experience.info["interact_failed"].astype(jnp.float32)
+        )
+        # the entropy bonus runs against a ceiling that `I` moves: `masked`
+        # makes the policy a categorical over the available options, so its
+        # maximum entropy is log(n_available) and a fixed ent_coef is a
+        # different coefficient in a state that admits 22 options than in one
+        # that admits 40. logged so a return change can be read against it
+        # rather than credited to selection. `available` is the mask that
+        # gated the action, not the one at the state after it. the mean of the
+        # log, not the log of the mean: the ceiling is per state, and
+        # n_available is available_frac times a static table size, so on its
+        # own it would carry nothing available_frac does not
+        n_available = jnp.sum(experience.available, axis=-1)
+        logs["option/entropy_ceiling"] = jnp.mean(jnp.log(n_available))
+        logs["option/entropy_ceiling_std"] = jnp.std(jnp.log(n_available))
+
+        # `selected` counts actions picked; `offered` counts actions available in pre-step mask.
+        n_actions = experience.available.shape[-1]
+        logs["option/selected"] = jnp.bincount( 
+            experience.action.ravel(), length=n_actions
+        )
+        logs["option/offered"] = jnp.sum(experience.available, axis=(0, 1))
+
+        # Fraction of decisions and steps with delayed rewards which estimate time spent holding a reward.
+ 
+        held = experience.info["reward_hold"] > 0
+        steps_taken = experience.info["primitive_steps"]
+        logs["hold/decision_frac"] = jnp.mean(held)
+        logs["hold/step_frac"] = jnp.sum(jnp.where(held, steps_taken, 0)) / jnp.sum(
+            steps_taken
+        )
 
         logs["iter/frames"] = train_state.frames
         logs["iter/decisions"] = train_state.decisions
         logs["iter/epochs"] = train_state.epoch
         logs["iter/updates"] = train_state.step
         logs["iter/learning_rate"] = learning_rate
-
-        if self.episode_callback is not None:
-            jax.debug.callback(
-                self.episode_callback,
-                experience.done,
-                experience.info["return"],
-                experience.t_next,
-                experience.info["primitive_steps"],
-                experience.step_type,
-                frames_before,
-                decisions_before,
-                ordered=True,
-            )
 
         if self.hparams.log_render:
             b = jax.random.randint(rng, (), 0, self.hparams.num_envs)
@@ -378,7 +425,10 @@ class PPO(Agent):
 
         return train_state, logs
 
-    def train(self, rng: jax.Array) -> Tuple[TrainingState, Dict]:
+    def init(self, rng: jax.Array) -> TrainingState:
+        """The training state before the first update."""
+        num_updates = self.num_updates
+
         # INIT NETWORK
         rng, _rng = jax.random.split(rng)
         init_x = self.env.observation_space.sample(_rng)
@@ -423,25 +473,7 @@ class PPO(Agent):
                 )
             )
 
-        # TRAIN LOOP
-        # the budget is in primitive steps, so an update costs num_steps *
-        # num_envs decisions times the mean option duration. The duration a
-        # policy actually draws drifts, so this is an estimate: `frames` below
-        # is the exact count and plots truncate to the shortest run.
-        num_updates = int(
-            self.hparams.budget
-            // (
-                self.hparams.num_steps
-                * self.hparams.num_envs
-                * self.hparams.mean_option_len
-            )
-        )
-        assert num_updates >= 1, (
-            f"budget {self.hparams.budget} buys less than one update of "
-            f"{self.hparams.num_steps * self.hparams.num_envs} decisions at "
-            f"{self.hparams.mean_option_len} primitive steps each"
-        )
-        train_state = TrainingState.create(
+        return TrainingState.create(
             apply_fn=jax.vmap(self.network.apply, in_axes=(None, 0)),
             params=params,
             tx=tx,
@@ -457,10 +489,15 @@ class PPO(Agent):
                 partial(self.network.apply, method="value"), in_axes=(None, 0)
             ),
         )
-        start_time = time.time()
-        train_state, logs = jax.lax.scan(self.update, train_state, length=num_updates)
-        elapsed = time.time() - start_time
-        logs["iter/fps"] = jnp.asarray([train_state.frames / elapsed] * num_updates)
-        logs["iter/wall_time"] = jnp.asarray([elapsed] * num_updates)
 
-        return train_state, logs
+    def run(
+        self, train_state: TrainingState, num_updates: int
+    ) -> Tuple[TrainingState, Dict]:
+        """Advance training by `num_updates` updates, returning stacked logs.
+
+        Repeated calls equal one scan of the summed length: the carry is the
+        whole training state and the learning rate reads `self.num_updates`,
+        not the length passed here. Hold `num_updates` constant across the
+        chunks of a run or the scan body compiles again.
+        """
+        return jax.lax.scan(self.update, train_state, length=num_updates)

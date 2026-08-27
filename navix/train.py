@@ -31,7 +31,7 @@ from options import (
 from ppo import PPO, PPOHparams
 
 UPDATES_PER_CHUNK = 16
-"""Target updates between host syncs, traded off against the transfer cost."""
+"""Updates between host syncs, traded off against the transfer cost."""
 
 OnChunk = Callable[[Sequence[int], Dict[str, Array]], None]
 """Called after each chunk with the seeds its logs' leading axis indexes."""
@@ -124,17 +124,6 @@ def make_agent(args: Args, cell: Cell) -> PPO:
     )
 
 
-def chunk_length(total_updates: int, target: int = UPDATES_PER_CHUNK) -> int:
-    """Largest divisor of `total_updates` not exceeding `target`.
-
-    A divisor, so every chunk is one length and the scan body compiles once.
-    """
-    for length in range(min(target, total_updates), 0, -1):
-        if total_updates % length == 0:
-            return length
-    return 1
-
-
 def train_cell(
     args: Args,
     cell: Cell,
@@ -150,20 +139,20 @@ def train_cell(
     time, which is what attributes a failure to a seed since vmap fuses them.
     """
     agent = make_agent(args, cell)
-    total_updates = agent.num_updates
-    updates = chunk_length(total_updates, updates_per_chunk)
-    n_chunks = total_updates // updates
 
     def advance(seed_group: Sequence[int]) -> None:
         """Run one group of seeds to completion, a chunk at a time."""
         keys = [jax.random.PRNGKey(int(seed)) for seed in seed_group]
         if vmap_seeds:
             state = jax.vmap(agent.init)(jnp.stack(keys))
-            step = jax.jit(jax.vmap(partial(agent.run, num_updates=updates)))
+            step = jax.jit(jax.vmap(partial(agent.run, num_updates=updates_per_chunk)))
         else:
             state = agent.init(keys[0])
-            step = jax.jit(partial(agent.run, num_updates=updates))
-        for _ in range(n_chunks):
+            step = jax.jit(partial(agent.run, num_updates=updates_per_chunk))
+        # the slowest seed of the group, so every one of them reaches the
+        # budget; the faster ones overrun and `episode_frame` drops what they
+        # record past it
+        while int(jnp.min(state.frames)) < args.budget:
             state, logs = step(state)
             if not vmap_seeds:
                 logs = jax.tree.map(lambda leaf: leaf[None], logs)

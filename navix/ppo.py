@@ -3,7 +3,8 @@
 #   - frames are counted in primitive steps, not decisions
 #   - episode lengths and per-decision discounting are read off the option
 #     environment's info rather than off the timestep clock
-#   - num_updates divides the budget by the mean option duration
+#   - training stops on the budget of primitive steps, not on an update count,
+#     and the learning rate anneals against the same count
 #   - the policy over options is masked to the initiation sets containing s_t
 #   - training is entered in chunks: `init` then repeated `run`
 from functools import partial
@@ -107,11 +108,11 @@ class PPO(Agent):
     env: Environment = None  # type: ignore[assignment]
 
     @property
-    def num_updates(self) -> int:
-        """Updates the budget buys over the whole run, not over one chunk.
+    def estimated_updates(self) -> int:
+        """Updates the budget is expected to buy, for reporting only.
 
-        An estimate: the budget is in primitive steps and the duration a policy
-        draws drifts, so `frames` on the training state is the exact count.
+        The duration a policy draws drifts as it learns, so training stops on
+        `frames` reaching the budget and nothing is scheduled against this.
         """
         updates = int(
             self.hparams.budget
@@ -306,6 +307,27 @@ class PPO(Agent):
             * self.hparams.num_steps
             // self.hparams.num_minibatches
         )
+        if self.hparams.anneal_lr:
+            # read before `collect_experience` advances `frames`, so the rate is
+            # the one this update starts on and is constant across its
+            # minibatches. Clamped at zero: a seed only runs past its budget
+            # because a slower seed of its group has not reached one, and a
+            # negative rate would make those updates gradient ascent
+            adam_state = train_state.opt_state[1]  # type: ignore[index]
+            fraction = jnp.maximum(
+                1.0 - train_state.frames / self.hparams.budget, 0.0
+            )
+            train_state = train_state.replace(
+                opt_state=(
+                    train_state.opt_state[0],  # type: ignore[index]
+                    adam_state._replace(
+                        hyperparams={
+                            **adam_state.hyperparams,
+                            "learning_rate": self.hparams.lr * fraction,
+                        }
+                    ),
+                )
+            )
         # collect experience
         train_state, experience = self.collect_experience(train_state)
 
@@ -427,25 +449,20 @@ class PPO(Agent):
 
     def init(self, rng: jax.Array) -> TrainingState:
         """The training state before the first update."""
-        num_updates = self.num_updates
-
         # INIT NETWORK
         rng, _rng = jax.random.split(rng)
         init_x = self.env.observation_space.sample(_rng)
         params = self.network.init(_rng, init_x)
 
-        def linear_schedule(count):
-            frac = (
-                1.0
-                - (count // (self.hparams.num_minibatches * self.hparams.num_epochs))
-                / num_updates
-            )
-            return self.hparams.lr * frac
-
-        lr = linear_schedule if self.hparams.anneal_lr else self.hparams.lr
+        # a float and not a schedule even under `anneal_lr`: `update` writes the
+        # annealed rate into `hyperparams` from the primitive steps spent, and a
+        # callable installs a schedule state that recomputes the rate from the
+        # optimiser's own step count and overwrites that write
         tx = optax.chain(
             optax.clip_by_global_norm(self.hparams.max_grad_norm),
-            optax.inject_hyperparams(optax.adam)(learning_rate=lr, eps=1e-5),
+            optax.inject_hyperparams(optax.adam)(
+                learning_rate=self.hparams.lr, eps=1e-5
+            ),
         )
 
         # INIT ENV
@@ -496,8 +513,8 @@ class PPO(Agent):
         """Advance training by `num_updates` updates, returning stacked logs.
 
         Repeated calls equal one scan of the summed length: the carry is the
-        whole training state and the learning rate reads `self.num_updates`,
-        not the length passed here. Hold `num_updates` constant across the
+        whole training state and the learning rate reads the primitive steps on
+        it, not the length passed here. Hold `num_updates` constant across the
         chunks of a run or the scan body compiles again.
         """
         return jax.lax.scan(self.update, train_state, length=num_updates)

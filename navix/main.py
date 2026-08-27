@@ -167,6 +167,17 @@ SWEEPS: Dict[str, Sweep] = {
         seeds=ANALYSIS_SEEDS,
         threshold=0.15,
     ),
+    "exp4_probe": Sweep(
+    Args(
+        env_id="Navix-DoorKey-8x8-v0", #env_id="Navix-KeyCorridorS6R3-v0"
+        max_steps=400,
+        budget=1_000_000,
+        tag="exp4_probe",
+    ),
+    conditions=("action",),
+    reward_delays=(0, 16, 32, 64),
+    seeds=ANALYSIS_SEEDS,
+),
     "exp4_decision": Sweep(
         Args(
             env_id="Navix-DoorKey-Random-16x16-v0",
@@ -177,7 +188,7 @@ SWEEPS: Dict[str, Sweep] = {
             option_seed=0,
             tag="exp4_decision",
         ),
-        conditions=("action", "option"),
+        conditions=("option"),
         families=("grammar",),
         n_options=(64,),
         reward_delays=(0, 8, 16, 32, 64),
@@ -404,7 +415,7 @@ def episode_frame(cell: Cell, seeds: Sequence[int], logs: Dict[str, object]):
     terminated = np.asarray(logs["step_type"])[done] == int(StepType.TERMINATION)
     lengths = np.asarray(logs["lengths"])[done]
     decisions = np.asarray(logs["decision_t"])[done]
-    return pd.DataFrame(
+    frame = pd.DataFrame(
         {
             **cell.identity,
             "seed": np.asarray(seeds)[seed_at],
@@ -416,6 +427,11 @@ def episode_frame(cell: Cell, seeds: Sequence[int], logs: Dict[str, object]):
             "mean_option_duration": lengths / decisions,
         }
     )
+    # a seed keeps training past its own budget only until the slowest seed of
+    # its group reaches one. What it records there is not part of the run: its
+    # trajectory up to the budget is the same either way, so dropping these rows
+    # is what stopping the seed at the budget would have left behind
+    return frame[frame.primitive_step <= cell.args.budget]
 
 
 class Results:
@@ -451,17 +467,23 @@ class Results:
         """Write `logs.npz` and the `meta.json` that marks the cell complete."""
         import numpy as np
 
+        # a key per seed rather than one array stacked over them: under
+        # `--no-vmap` each seed loops to its own chunk count and the stack would
+        # be ragged
         stacked = {
-            key: np.stack(
-                [
-                    np.concatenate([chunk[key] for chunk in self.diagnostics[seed]])
-                    for seed in self.cell.seeds
-                ]
+            f"{key}/seed{seed}": np.concatenate(
+                [chunk[key] for chunk in self.diagnostics[seed]]
             )
-            for key in self.diagnostics[self.cell.seeds[0]][0]
+            for seed in self.cell.seeds
+            for key in self.diagnostics[seed][0]
         }
         np.savez(self.cell.directory / "logs.npz", **stacked)
-        frames = int(stacked["iter/frames"][:, -1].sum())
+        # clipped, since a seed's last updates are the overrun `episode_frame`
+        # drops rather than steps the cell spent
+        frames = sum(
+            min(int(stacked[f"iter/frames/seed{seed}"][-1]), self.cell.args.budget)
+            for seed in self.cell.seeds
+        )
         meta = {
             "cell": self.cell.name,
             "group": self.cell.group,
@@ -513,7 +535,7 @@ def report(chunk: int, chunks: int, logs: Dict[str, object]) -> None:
         return float(np.asarray(logs[key]).mean())
 
     print(
-        f"  chunk {chunk}/{chunks} "
+        f"  chunk {chunk}/~{chunks} "
         f"frames={int(np.asarray(logs['iter/frames'])[:, -1].mean())} "
         f"episodes={finished} return={mean:.3f} "
         f"steps={average('option/steps_mean'):.2f} "
@@ -525,11 +547,14 @@ def report(chunk: int, chunks: int, logs: Dict[str, object]) -> None:
 
 def run_cell(cell: Cell, vmap_seeds: bool = True) -> None:
     """Build, train and record one cell, removing its directory if it fails."""
-    from train import build_cell, chunk_length, make_agent, train_cell
+    from train import UPDATES_PER_CHUNK, build_cell, make_agent, train_cell
 
     built = build_cell(cell.args)
     agent = make_agent(cell.args, built)
-    chunks = agent.num_updates // chunk_length(agent.num_updates)
+    # an estimate, since the run ends on the budget in primitive steps and the
+    # duration a policy draws drifts away from the one measured here
+    updates = agent.estimated_updates
+    chunks = max(updates // UPDATES_PER_CHUNK, 1)
     if not vmap_seeds:
         chunks *= len(cell.seeds)
 
@@ -538,7 +563,8 @@ def run_cell(cell: Cell, vmap_seeds: bool = True) -> None:
         f"  seeds {list(cell.seeds)}, {len(built.table)} actions, "
         f"{built.mean_option_len:.2f} primitive steps per option measured "
         f"({built.nominal_option_len:.2f} nominal), at most {built.spec.horizon}; "
-        f"{agent.num_updates} updates in {chunks} chunks",
+        f"{cell.args.budget} primitive steps, about {updates} updates "
+        f"in {chunks} chunks",
         flush=True,
     )
     if built.missing_interactions:
@@ -619,6 +645,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"    {sys.executable} {HERE / 'main.py'} --sweep {options.sweep} "
             f"--cell {cell.name} --no-vmap"
         )
+    if len(failures) < len(cells):
+        # every cell of an invocation shares one group, and the trailing `*` is
+        # what reaches the cells inside it: a pattern matches `{group}/{cell}`
+        print(f"  plot it:\n    python plot.py --cells '{cells[0].group}*'")
     return 1 if failures else 0
 
 

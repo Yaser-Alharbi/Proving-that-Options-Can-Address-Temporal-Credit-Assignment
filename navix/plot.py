@@ -69,10 +69,15 @@ CONDITION_LABEL: Dict[str, str] = {
     "both": "both (option + action space)",
 }
 FAMILY_DASH: Dict[str, str] = {"grammar": "-", "random": "--"}
+GRAMMAR_COLOR = "black"
+"""The structured catalogue, off the viridis ramp that colours random draws."""
 
 COUNT_COLORMAP = "viridis"
 COUNT_COLOR_RANGE = (0.15, 0.9)
 """Ends trimmed off the ramp: its pale tail is invisible on white."""
+
+DRAW_BAND_ALPHA = 0.08
+"""Lighter than `BAND_ALPHA`: six overlapping draws would otherwise stack opaque."""
 
 BASELINE_DASH = "--"
 """How the action baseline is drawn where colour is spent on catalogue size."""
@@ -435,10 +440,23 @@ def draw_bands(axis: Axes, table: pd.DataFrame, varying: Sequence[str],
 
     Under `colors`, an option cell takes the colour of its catalogue size and is named by
     it alone; the action cell keeps its condition colour and is dashed, as a reference.
+    With no `colors`, a varying `option_seed` ramps random draws over viridis;
+    grammar stays `GRAMMAR_COLOR`.
     """
     # the seed count and method go in the caption where every cell agrees, which is the
     # usual case, and stay on the entry where a short cell fell back to median-and-range
     suffix = "" if shared_estimate(table) else " ({} seeds, {})"
+    seed_colors: Optional[Dict[int, Tuple[float, float, float, float]]] = None
+    if colors is None and "option_seed" in varying:
+        drawn = table[(table.condition != "action") & (table.family != "grammar")]
+        seeds = sorted({int(seed) for seed in drawn.option_seed.unique()})
+        if seeds:
+            low, high = COUNT_COLOR_RANGE
+            colormap = matplotlib.colormaps[COUNT_COLORMAP]
+            seed_colors = {
+                seed: colormap(low + (high - low) * position / max(len(seeds) - 1, 1))
+                for position, seed in enumerate(seeds)
+            }
     # sorted by what the legend prints, so `n=8` precedes `n=16`; grouping by the cell name
     # alone orders the legend lexically, and sort=False then keeps this order
     order = [*dict.fromkeys(["_condition_at", *varying]), "cell"]
@@ -447,6 +465,9 @@ def draw_bands(axis: Axes, table: pd.DataFrame, varying: Sequence[str],
         first = group.iloc[0]
         counted = colors is not None and first.condition != "action"
         color = colors[int(first.n_options)] if counted else CONDITION_COLOR[first.condition]
+        if seed_colors is not None and first.condition != "action":
+            color = (GRAMMAR_COLOR if first.family == "grammar"
+                     else seed_colors[int(first.option_seed)])
         axis.plot(group.primitive_step, group.point, color=color, linewidth=LINE_WIDTH,
                   linestyle=FAMILY_DASH.get(first.family, "-") if colors is None
                   else ("-" if counted else BASELINE_DASH),
@@ -455,7 +476,8 @@ def draw_bands(axis: Axes, table: pd.DataFrame, varying: Sequence[str],
                   + suffix.format(int(first.n_seeds),
                                   METHOD_PHRASE.get(first.method, first.method)))
         axis.fill_between(group.primitive_step, group.low, group.high, color=color,
-                          alpha=BAND_ALPHA, linewidth=0)
+                          alpha=DRAW_BAND_ALPHA if seed_colors is not None else BAND_ALPHA,
+                          linewidth=0, edgecolor="none")
 
 def settled_steps(table: pd.DataFrame) -> List[float]:
     """The step past which each cell's curve stops moving, over the cells that moved."""
@@ -838,6 +860,7 @@ EXPERIMENT_FIGURES: Dict[str, Tuple[str, ...]] = {
     "exp1": ("return_curve", "threshold_table", "length_curve"),
     "exp2": ("option_count_sweep", "threshold_table", "count_overlay"),
     "exp3": ("return_curve", "threshold_table","duration_vs_cap"),
+    "exp4": ("degradation_curve", "Return curves faceted by k", "threshold_table"),
 }
 """What each experiment's tag is there to show; an untagged or unknown group draws
 everything not `DISABLED`."""

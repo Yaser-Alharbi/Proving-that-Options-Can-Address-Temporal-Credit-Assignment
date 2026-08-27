@@ -12,6 +12,7 @@ from matplotlib.colors import to_rgb
 from plot import (
     CONDITION_COLOR,
     CONDITION_LABEL,
+    GRAMMAR_COLOR,
     MIN_SEEDS_FOR_IQM,
     Inputs,
     MissingData,
@@ -23,6 +24,7 @@ from plot import (
     duration_vs_cap,
     estimate,
     iqm,
+    return_curve,
     series_label,
     settled_steps,
     steps_to_threshold,
@@ -91,6 +93,22 @@ def overlay_args() -> argparse.Namespace:
     """Options an overlay figure reads, with smoothing switched off."""
     return argparse.Namespace(bins=GRID_POINTS, window=1, threshold=None,
                               resamples=RESAMPLES)
+
+
+def draw_episodes() -> pd.DataFrame:
+    """Grammar os=0 and two random draws, all option condition."""
+    steps = np.arange(GRID_STEP, LAST_STEP + 1, GRID_STEP)
+    cells = (("grammar", 0), ("random", 0), ("random", 1))
+    return pd.concat([
+        pd.DataFrame({
+            "cell": f"group/{family}-os{option_seed}", "group": "group", "env_id": "env",
+            "condition": "option", "family": family,
+            "n_options": 64, "option_seed": option_seed, "tag": "exp3", "seed": seed,
+            "primitive_step": steps,
+            "episodic_return": np.full(steps.size, (option_seed + 1) / 4.0),
+        })
+        for family, option_seed in cells for seed in range(2)
+    ], ignore_index=True)
 
 def settle_steps() -> np.ndarray:
     """The x positions the curves in `curve_table` are sampled at."""
@@ -291,6 +309,25 @@ def test_count_overlay_needs_two_catalogue_sizes() -> None:
     data = Inputs(frame[frame.n_options != 64], pd.DataFrame(), overlay_args())
     with pytest.raises(MissingData, match="two catalogue sizes"):
         count_overlay(data)
+
+
+def test_return_curve_colours_lines_by_draw() -> None:
+    """Grammar is the reference colour; random draws take the viridis ramp; each band matches its line."""
+    data = Inputs(draw_episodes(), pd.DataFrame(), overlay_args())
+    figure, _ = return_curve(data)
+    axis = figure.get_axes()[0]
+    grammar, random_0, random_1 = axis.lines
+    assert [line.get_label() for line in axis.lines] == [
+        "grammar, os=0", "random, os=0", "random, os=1",
+    ]
+    assert to_rgb(grammar.get_color()) == pytest.approx(to_rgb(GRAMMAR_COLOR))
+    assert to_rgb(random_0.get_color()) != pytest.approx(to_rgb(GRAMMAR_COLOR))
+    assert to_rgb(random_0.get_color()) != pytest.approx(to_rgb(random_1.get_color()))
+    assert grammar.get_linestyle() == "-"
+    assert random_0.get_linestyle() != "-"
+    for line, collection in zip(axis.lines, axis.collections):
+        assert to_rgb(collection.get_facecolor()[0]) == pytest.approx(to_rgb(line.get_color()))
+    plt.close(figure)
 
 def test_settled_steps_ignores_a_curve_that_never_moved() -> None:
     """A cell flat at its floor never learned, so it is not a curve that settled."""

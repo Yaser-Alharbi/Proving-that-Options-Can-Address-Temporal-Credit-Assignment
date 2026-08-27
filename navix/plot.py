@@ -18,6 +18,7 @@ import numpy as np
 import pandas as pd
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
+from matplotlib.patches import ConnectionPatch
 from matplotlib.ticker import ScalarFormatter
 from scipy.stats import trim_mean
 
@@ -92,7 +93,7 @@ of them between an action cell and an option cell means only "not applicable".""
 ARGS_FIELD: Dict[str, str] = {"condition": "action_space", "family": "option_family"}
 """Identity columns whose `Args` field carries another name."""
 
-FIELD_PREFIX: Dict[str, str] = {"family": "", "n_options": "n="}
+FIELD_PREFIX: Dict[str, str] = {"family": "", "n_options": "n=", "option_seed": "os="}
 """How a varying field is written in a legend entry; anything else is written `key=`."""
 
 DEFAULTS = Args()
@@ -173,6 +174,7 @@ def load_meta(patterns: Sequence[str]) -> pd.DataFrame:
             "condition": arguments["action_space"],
             "family": arguments["option_family"],
             "n_options": arguments["n_options"],
+            "option_seed": arguments["option_seed"],
             "tag": arguments["tag"] or UNTAGGED,
             **{k: meta[k] for k in ("max_option_len", "mean_option_len", "nominal_option_len")},
             **{f"duration_{k}": v for k, v in meta["duration_stats"].items()},
@@ -375,12 +377,13 @@ def varying_fields(table: pd.DataFrame) -> List[str]:
             and (option_rows if key in OPTION_ONLY else table)[key].nunique(dropna=False) > 1]
 
 def series_label(row: pd.Series, varying: Sequence[str]) -> str:
-    """A legend entry: the condition, then only what else separates this cell."""
+    """A legend entry: the condition when it varies, then only what else separates this cell."""
     named = [key for key in varying if key != "condition"
              and (row.condition != "action" or key not in OPTION_ONLY)]
-    return ", ".join([CONDITION_LABEL[row.condition]]
-                     + [f"{FIELD_PREFIX.get(key, key + '=')}{short(str(row[key]))}"
-                        for key in named])
+    parts = ([CONDITION_LABEL[row.condition]] if "condition" in varying or not named else [])
+    parts += [f"{FIELD_PREFIX.get(key, key + '=')}{short(str(row[key]))}"
+              for key in named]
+    return ", ".join(parts)
 
 def shared_estimate(table: pd.DataFrame) -> str:
     """`n seeds, method` where every cell of `table` agrees on both, else empty."""
@@ -488,18 +491,17 @@ def apply_x_scale(axes: Sequence[Axes], table: pd.DataFrame) -> None:
         axis.set_xlim(float(drawn.min()) if logarithmic else 0.0, right)
 
 def finish(figure: Figure, axes: Sequence[Axes], title: str, caption: str = "") -> None:
-    """Grid, scientific x labels, a title, a caption top right and a legend along the foot."""
+    """Grid, scientific x labels, a title, a caption under it, and a legend along the foot."""
     for axis in axes:
         axis.grid(alpha=GRID_ALPHA)
         if axis.get_xscale() == "linear":
             axis.ticklabel_format(axis="x", style="sci", scilimits=SCI_LIMITS,
                                   useMathText=True)
-    # flushed to the canvas rather than centred or to the axes, whose left edge moves right
-    # with the width of the y tick labels: the rest of the band is then free for a caption
-    figure.suptitle(title, x=0.0, ha="left")
-    figure.tight_layout()
+    # caption a line below the title: they share y=1 and collide once the title is long
+    figure.tight_layout(rect=[0.0, 0.0, 1.0, 0.82 if caption else 0.94])
+    figure.suptitle(title, x=0.0, y=0.99, ha="left")
     if caption:
-        figure.text(1.0, 1.0, caption, ha="right", va="top", fontsize=SMALL_FONT)
+        figure.text(0.0, 0.91, caption, ha="left", va="top", fontsize=SMALL_FONT)
     # one legend for the whole figure, in figure coordinates and only once
     # tight_layout has settled the axes: an axes-fraction offset lands on the x
     # label, and a legend per panel is wider than the panel it belongs to
@@ -711,9 +713,7 @@ def option_count_sweep(data: Inputs) -> Tuple[Figure, pd.DataFrame]:
     return figure, table
 
 def duration_vs_cap(data: Inputs) -> Tuple[Figure, pd.DataFrame]:
-    """Measured option durations against the table's cap, per cell."""
-    # not the requested histogram: per-decision durations are never stored, only means
-    # and duration_stats' largest lane, which is the only saturation statistic there is
+    """Measured mean duration by catalogue draw, and worst-lane duration against the cap."""
     columns = tuple(column for column, _, _ in DURATION_MARKERS)
     table = require_columns(data.meta, columns + ("max_option_len",), "duration")
     table = table[table.condition != "action"].copy()
@@ -724,24 +724,57 @@ def duration_vs_cap(data: Inputs) -> Tuple[Figure, pd.DataFrame]:
         raise MissingData(f"every loaded cell caps options at {caps[0]:g} primitive steps, "
                           "so there is nothing to compare")
     table["saturation"] = table.duration_max_lane_max / table.max_option_len
-    table = table.sort_values(["n_options", "family", "cell"])
+    table = pd.concat([
+        table[table.family.eq("grammar")].sort_values("mean_option_len"),
+        table[table.family.ne("grammar")].sort_values("mean_option_len"),
+    ], ignore_index=True)
     varying = varying_fields(table)
-
     at = np.arange(len(table))
-    figure, axis = plt.subplots(figsize=(FIGURE_SIZE[0], 2.0 + ROW_HEIGHT * len(table)))
-    axis.scatter(table.max_option_len, at, marker="|", s=CAP_MARKER_SIZE, color="black",
-                 label="cap")
-    for column, label, marker in DURATION_MARKERS:
-        axis.scatter(table[column], at, marker=marker, label=label)
-    axis.set_yticks(at)
-    # what separates this cell from the others, as in a legend entry; everything the rows
-    # share is in the caption, so the cell name would repeat it on every tick
-    axis.set_yticklabels([series_label(row, varying) for _, row in table.iterrows()],
-                         fontsize=SMALL_FONT)
-    axis.set_xlabel("primitive steps per option")
-    axis.set_xlim(left=0)
-    finish(figure, [axis], "realised option duration against the cap",
+    labels = [series_label(row, varying) for _, row in table.iterrows()]
+    mean_series = DURATION_MARKERS[:2]
+    lane_series = DURATION_MARKERS[2:]
+    mean_columns = [column for column, _, _ in mean_series]
+    lane_columns = [column for column, _, _ in lane_series] + ["max_option_len"]
+    cycle = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    n_grammar = int(table.family.eq("grammar").sum())
+
+    figure, (means, lanes) = plt.subplots(
+        1, 2, sharey=True,
+        figsize=(FIGURE_SIZE[0], 2.0 + ROW_HEIGHT * len(table)),
+    )
+    for index, (column, label, marker) in enumerate(mean_series):
+        means.scatter(table[column], at, marker=marker, label=label, color=cycle[index])
+    left = table[mean_columns].to_numpy()
+    left_pad = max(0.08 * float(left.max() - left.min()), 0.25)
+    means.set_xlim(float(left.min()) - left_pad, float(left.max()) + left_pad)
+    means.set_xlabel("primitive steps per option")
+    means.set_yticks(at)
+    means.set_yticklabels(labels, fontsize=SMALL_FONT)
+    means.invert_yaxis()
+
+    lanes.hlines(at, table.duration_max_lane_mean, table.duration_max_lane_max,
+                 color="0.85", zorder=0)
+    lanes.scatter(table.max_option_len, at, marker="|", s=CAP_MARKER_SIZE, color="black",
+                  label="cap")
+    for index, (column, label, marker) in enumerate(lane_series):
+        lanes.scatter(table[column], at, marker=marker, label=label,
+                      color=cycle[len(mean_series) + index])
+    lanes.set_xlim(0.0, float(table[lane_columns].to_numpy().max()) * 1.08)
+    lanes.set_xlabel("primitive steps per option")
+    lanes.tick_params(axis="y", left=False, labelleft=False)
+    finish(figure, [means, lanes], "realised option duration against the cap",
            caption_for(table, varying))
+    for axis in (means, lanes):
+        axis.yaxis.grid(False)
+    if 0 < n_grammar < len(table):
+        y = n_grammar - 0.5
+        for axis in (means, lanes):
+            axis.axhline(y, color="0.4", linewidth=0.8)
+        figure.add_artist(ConnectionPatch(
+            (means.get_xlim()[1], y), (lanes.get_xlim()[0], y),
+            coordsA=means.transData, coordsB=lanes.transData,
+            color="0.4", linewidth=0.8, clip_on=False,
+        ))
     return figure, table
 
 def option_usage(data: Inputs) -> Tuple[Figure, pd.DataFrame]:
@@ -765,7 +798,7 @@ def threshold_table(data: Inputs) -> Tuple[Figure, pd.DataFrame]:
          f"{row.n_crossed}/{row.n_seeds}", row.method]
         for _, row in table.iterrows()
     ]
-    height = 1.0 + ROW_HEIGHT * (len(body) + 1)
+    height = 1.4 + ROW_HEIGHT * (len(body) + 1)
     figure, axis = plt.subplots(figsize=(FIGURE_SIZE[0], height))
     axis.axis("off")
     # bbox, not loc: `loc` centres a table sized to its text, leaving the figure
@@ -775,13 +808,14 @@ def threshold_table(data: Inputs) -> Tuple[Figure, pd.DataFrame]:
     rendered.auto_set_font_size(False)
     rendered.auto_set_column_width(range(len(body[0])))
     rendered.set_fontsize(SMALL_FONT)
-    # one value: a group is one environment and one tag, which is what a threshold is by
-    figure.suptitle(f"primitive steps to episodic return {table.threshold.iloc[0]:g} "
-                    f"({data.args.window}-episode moving average)")
-    figure.tight_layout()
     caption = caption_for(table, varying)
+    # tight_layout ignores suptitle; a caption at y=1 sits in the title's band
+    figure.tight_layout(rect=[0.0, 0.0, 1.0, 0.84 if caption else 0.92])
+    figure.suptitle(f"primitive steps to episodic return {table.threshold.iloc[0]:g} "
+                    f"({data.args.window}-episode moving average)",
+                    x=0.0, y=0.99, ha="left")
     if caption:
-        figure.text(1.0, 1.0, caption, ha="right", va="top", fontsize=SMALL_FONT)
+        figure.text(1.0, 0.90, caption, ha="right", va="top", fontsize=SMALL_FONT)
     return figure, table
 
 
@@ -803,7 +837,7 @@ DISABLED = frozenset({"option_usage"})
 EXPERIMENT_FIGURES: Dict[str, Tuple[str, ...]] = {
     "exp1": ("return_curve", "threshold_table", "length_curve"),
     "exp2": ("option_count_sweep", "threshold_table", "count_overlay"),
-    "exp3": ("family_overlay", "return_curve", "threshold_table"),
+    "exp3": ("return_curve", "threshold_table","duration_vs_cap"),
 }
 """What each experiment's tag is there to show; an untagged or unknown group draws
 everything not `DISABLED`."""

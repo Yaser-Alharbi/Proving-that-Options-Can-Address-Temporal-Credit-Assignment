@@ -778,6 +778,21 @@ class OptionEnv(Environment):
         false = jnp.asarray(False)
         interacted = self.spec.interact[action] < 0
         neighbours = _neighbours(inner.state)
+        init_status = _status(
+            self.spec,
+            action,
+            inner.state,
+            neighbours,
+            home_aim,
+            zero,
+            zero,
+            interacted,
+            false,
+        )
+        # Mask iteration 0 so a beta-fires-on-selection option costs zero steps,
+        # as it does under `while_loop`. `started_done` is excluded: its one step
+        # performs the autoreset.
+        init_fired = (init_status == STATUS_DONE) & jnp.logical_not(started_done)
         init = Execution(
             current=inner,
             aim=home_aim,
@@ -785,19 +800,9 @@ class OptionEnv(Environment):
             detoured=zero,
             interacted=interacted,
             attempted=false,
-            status=_status(
-                self.spec,
-                action,
-                inner.state,
-                neighbours,
-                home_aim,
-                zero,
-                zero,
-                interacted,
-                false,
-            ),
+            status=init_status,
             neighbours=neighbours,
-            stop=false,
+            stop=init_fired,
             total=jnp.asarray(0.0, dtype=jnp.float32),
             steps=zero,
             banked=timestep.info["reward_banked"],

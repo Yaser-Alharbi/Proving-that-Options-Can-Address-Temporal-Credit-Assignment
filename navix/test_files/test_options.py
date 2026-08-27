@@ -220,6 +220,31 @@ def test_a_blocked_option_with_no_work_never_spins() -> None:
     assert position_of(stepped) == (1, 1)
 
 
+def test_scan_executor_matches_while_loop_on_a_beta_fires_on_selection_option() -> (
+    None
+):
+    """A `beta`-fires-on-selection option costs zero steps under `scan`, not just `while_loop`.
+
+    `initiation`'s graded fallback (`options.py`'s `initiation`) can select such
+    an option when nothing else has work; this checks the executor, not `I`, by
+    stepping it directly.
+    """
+    blocked = (EAST, 1, NO_INTERACT, 0)
+    timestep = build(BLOCKED_EAST, player_position=(1, 1), player_direction=EAST)
+
+    fast_stepped = option_env([blocked], executor="while_loop").step(
+        timestep, jnp.asarray(0)
+    )
+    slow_stepped = option_env([blocked], executor="scan").step(
+        timestep, jnp.asarray(0)
+    )
+
+    assert int(fast_stepped.info["primitive_steps"]) == 0
+    assert int(slow_stepped.info["primitive_steps"]) == 0
+    assert position_of(slow_stepped) == (1, 1)
+    assert int(slow_stepped.state.get_player().direction) == EAST
+
+
 @pytest.mark.parametrize("seed", range(10))
 def test_no_available_option_is_zero_length(seed: int) -> None:
     """Any option present in `I` consumes at least one primitive step, checked over sampled states."""

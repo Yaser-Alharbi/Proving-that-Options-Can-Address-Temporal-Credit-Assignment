@@ -8,13 +8,19 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from matplotlib.colors import to_rgb
 from plot import (
+    CONDITION_COLOR,
+    CONDITION_LABEL,
     MIN_SEEDS_FOR_IQM,
     Inputs,
+    MissingData,
     apply_x_scale,
     bootstrap_indices,
     collinear,
+    count_overlay,
     crossing_step,
+    duration_vs_cap,
     estimate,
     iqm,
     series_label,
@@ -64,6 +70,27 @@ def crossings(crossing_seeds: List[int], n_seeds: int) -> pd.Series:
     )
     data = Inputs(frame, pd.DataFrame(), arguments)
     return steps_to_threshold(data, frame, default_rng()).iloc[0]
+
+def overlay_episodes() -> pd.DataFrame:
+    """An action baseline and two option conditions, each at two catalogue sizes."""
+    # from GRID_STEP, not zero: a geometric grid cannot start at a step of zero
+    steps = np.arange(GRID_STEP, LAST_STEP + 1, GRID_STEP)
+    cells = (("action", 0), ("option", 8), ("option", 64), ("both", 8), ("both", 64))
+    return pd.concat([
+        pd.DataFrame({
+            "cell": f"group/{condition}-n{n_options}", "group": "group", "env_id": "env",
+            "condition": condition, "family": "-" if condition == "action" else "grammar",
+            "n_options": n_options, "option_seed": 0, "tag": "exp2", "seed": seed,
+            "primitive_step": steps,
+            "episodic_return": np.full(steps.size, n_options / 256.0),
+        })
+        for condition, n_options in cells for seed in range(2)
+    ], ignore_index=True)
+
+def overlay_args() -> argparse.Namespace:
+    """Options an overlay figure reads, with smoothing switched off."""
+    return argparse.Namespace(bins=GRID_POINTS, window=1, threshold=None,
+                              resamples=RESAMPLES)
 
 def settle_steps() -> np.ndarray:
     """The x positions the curves in `curve_table` are sampled at."""
@@ -178,6 +205,92 @@ def test_series_label_omits_a_field_that_cannot_apply() -> None:
     assert [series_label(row, varying) for _, row in table.iterrows()] == [
         "action space", "option space, n=8", "option space, n=64",
     ]
+
+def test_series_label_names_a_catalogue_draw() -> None:
+    """A shared condition is omitted, so a draw is `family, os=` as on the threshold table."""
+    table = pd.DataFrame({
+        "cell": ["g", "r0", "r1"], "env_id": ["env"] * 3,
+        "condition": ["option"] * 3, "family": ["grammar", "random", "random"],
+        "option_seed": [0, 0, 1], "n_options": [64] * 3, "tag": ["exp3"] * 3,
+    })
+    varying = varying_fields(table)
+    assert varying == ["family", "option_seed"]
+    assert [series_label(row, varying) for _, row in table.iterrows()] == [
+        "grammar, os=0", "random, os=0", "random, os=1",
+    ]
+
+def duration_meta() -> pd.DataFrame:
+    """Four option cells: one grammar, three random draws, two distinct caps."""
+    # random rows are not insertion-ordered by measured mean, so a sort is observable
+    rows = (
+        ("random", 2, 6.33, 9.76, 35.03, 49.0, 51.0),
+        ("grammar", 0, 8.25, 6.44, 10.47, 11.0, 11.0),
+        ("random", 0, 5.91, 6.63, 29.11, 43.0, 45.0),
+        ("random", 1, 6.48, 7.96, 32.69, 49.0, 51.0),
+    )
+    return pd.DataFrame([
+        {
+            "cell": f"group/{family}-os{option_seed}", "group": "group", "env_id": "env",
+            "condition": "option", "family": family, "n_options": 64,
+            "option_seed": option_seed, "tag": "exp3",
+            "nominal_option_len": nominal, "mean_option_len": measured,
+            "duration_max_lane_mean": lane_mean, "duration_max_lane_max": lane_max,
+            "max_option_len": cap,
+        }
+        for family, option_seed, nominal, measured, lane_mean, lane_max, cap in rows
+    ])
+
+def test_duration_vs_cap_separates_means_from_the_cap() -> None:
+    """Left x-range is the means; grammar is pinned above random sorted by measured mean."""
+    data = Inputs(pd.DataFrame(), duration_meta(), argparse.Namespace())
+    figure, table = duration_vs_cap(data)
+    means, lanes = figure.get_axes()
+    assert [tick.get_text() for tick in means.get_yticklabels()] == [
+        "grammar, os=0", "random, os=0", "random, os=1", "random, os=2",
+    ]
+    assert list(table.mean_option_len) == pytest.approx([6.44, 6.63, 7.96, 9.76])
+    left = table[["nominal_option_len", "mean_option_len"]].to_numpy()
+    left_pad = max(0.08 * float(left.max() - left.min()), 0.25)
+    assert means.get_xlim() == (
+        pytest.approx(float(left.min()) - left_pad),
+        pytest.approx(float(left.max()) + left_pad),
+    )
+    assert means.get_xlim()[0] > 0
+    right_end = float(table[["duration_max_lane_mean", "duration_max_lane_max",
+                             "max_option_len"]].to_numpy().max())
+    assert lanes.get_xlim() == (pytest.approx(0.0), pytest.approx(right_end * 1.08))
+    plt.close(figure)
+
+
+def test_count_overlay_facets_by_condition_and_keys_colour_to_count() -> None:
+    """A panel per option condition, the baseline dashed in each, colour naming only n."""
+    data = Inputs(overlay_episodes(), pd.DataFrame(), overlay_args())
+    figure, table = count_overlay(data)
+    axes = figure.get_axes()
+    assert [axis.get_title() for axis in axes] == [CONDITION_LABEL["option"],
+                                                   CONDITION_LABEL["both"]]
+    per_count: Dict[str, set] = {}
+    for axis in axes:
+        assert [line.get_label() for line in axis.lines] == ["action space", "n=8", "n=64"]
+        baseline, *counted = axis.lines
+        assert to_rgb(baseline.get_color()) == pytest.approx(
+            to_rgb(CONDITION_COLOR["action"])
+        )
+        assert baseline.get_linestyle() != "-"
+        assert len({line.get_color() for line in counted}) == len(counted)
+        for line in counted:
+            per_count.setdefault(line.get_label(), set()).add(line.get_color())
+    # one colour per catalogue size across the whole figure, or the legend cannot be shared
+    assert all(len(colors) == 1 for colors in per_count.values())
+    assert set(table.condition) == {"action", "option", "both"}
+    plt.close(figure)
+
+def test_count_overlay_needs_two_catalogue_sizes() -> None:
+    """A single catalogue size has no axis to colour, so the figure is skipped."""
+    frame = overlay_episodes()
+    data = Inputs(frame[frame.n_options != 64], pd.DataFrame(), overlay_args())
+    with pytest.raises(MissingData, match="two catalogue sizes"):
+        count_overlay(data)
 
 def test_settled_steps_ignores_a_curve_that_never_moved() -> None:
     """A cell flat at its floor never learned, so it is not a curve that settled."""

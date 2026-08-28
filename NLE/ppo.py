@@ -26,7 +26,7 @@ from nle import nethack
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
 
-from envs import make_env
+from envs import TASK_SUCCESSFUL, make_env
 
 MASKED_LOGIT = -1e8
 """Logit given to an unavailable action. Large and negative rather than -inf, so
@@ -42,8 +42,9 @@ killed one."""
 
 IDENTITY_SENTINEL_STR = "-"
 IDENTITY_SENTINEL_INT = 0
-"""Navix identity columns with no NLE analogue. Kept so plot.py reads both
-tracks without joins; a difference from an action cell means "not applicable"."""
+"""Navix identity columns with no NLE analogue: `executor`, because one Python
+loop is the only executor, and `max_forward`, because no reach bound parameterises
+the NLE catalogue. Kept so plot.py reads both tracks without joins."""
 
 IDENTITY_COLUMNS = (
     "env_id",
@@ -67,6 +68,11 @@ EPISODE_COLUMNS = IDENTITY_COLUMNS + (
     "episodic_return",
     "episodic_length",
     "terminated",
+    # not the same question as `terminated`, which NLE also sets on death and on
+    # its own step-limit abort. Navix's `terminated` means goal-reached; giving
+    # this column that meaning and leaving `terminated` the gymnasium flag keeps
+    # one name per question on both tracks.
+    "solved",
     "mean_option_duration",
 )
 
@@ -90,6 +96,17 @@ class Args:
     """training budget in PRIMITIVE steps, not decisions"""
     condition: Literal["action", "option", "both"] = "action"
     """primitives only, options only, or the union of both"""
+    n_options: int = 64
+    """how many rows the catalogue is subsampled to; ignored when condition is `action`"""
+    option_family: Literal["grammar", "grammar_depth", "random"] = "grammar"
+    """`grammar` takes the catalogue breadth-first across its row classes,
+    `grammar_depth` longest-reach-first, `random` a uniform draw seeded by
+    `option_seed`. `grammar` is the same catalogue in every experiment that names
+    it; only exp3 runs `grammar_depth`."""
+    option_seed: int = 0
+    """seed for the random option family, kept separate from the training seeds"""
+    reward_delay: int = 0
+    """primitive steps between earning the terminal reward and being paid it. 0 is off."""
     discount: Literal["decision", "primitive"] = "decision"
     """gamma once per decision, or raised to the option's duration (SMDP)"""
     max_episode_steps: int = 100_000
@@ -167,16 +184,17 @@ def masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
 
 def cell_identity(args: Args) -> Dict[str, object]:
     """Navix `Cell.identity` columns for one NLE episode row."""
+    options = args.condition != "action"
     return {
         "env_id": args.env_id,
         "condition": args.condition,
-        "family": IDENTITY_SENTINEL_STR,
-        "n_options": IDENTITY_SENTINEL_INT,
-        "option_seed": IDENTITY_SENTINEL_INT,
+        "family": args.option_family if options else IDENTITY_SENTINEL_STR,
+        "n_options": args.n_options if options else IDENTITY_SENTINEL_INT,
+        "option_seed": args.option_seed,
         "budget": args.budget,
         "max_forward": IDENTITY_SENTINEL_INT,
         "max_steps": args.max_episode_steps,
-        "reward_delay": IDENTITY_SENTINEL_INT,
+        "reward_delay": args.reward_delay,
         "gamma": args.gamma,
         "discount": args.discount,
         "executor": IDENTITY_SENTINEL_STR,
@@ -424,7 +442,11 @@ if __name__ == "__main__":
     )
 
     identity = cell_identity(args)
-    csv_path = run_dir / "episodes.csv"
+    # per seed, not per cell: main.py runs the seeds of one cell concurrently
+    # into one directory, and two processes appending to one file race on the
+    # header and interleave their rows. The `seed` column makes the union of a
+    # cell's files the same table the single file used to be.
+    csv_path = run_dir / f"episodes_seed{args.seed}.csv"
     csv_file = open(csv_path, "a", newline="")
     csv_writer = csv.DictWriter(csv_file, fieldnames=list(EPISODE_COLUMNS))
     if csv_path.stat().st_size == 0:
@@ -454,6 +476,10 @@ if __name__ == "__main__":
                 args.gamma,
                 args.max_episode_steps,
                 args.clip_reward,
+                args.n_options,
+                args.option_family,
+                args.option_seed,
+                args.reward_delay,
             )
             for i in range(args.num_envs)
         ],
@@ -570,6 +596,9 @@ if __name__ == "__main__":
                             "episodic_return": episodic_return,
                             "episodic_length": episodic_length,
                             "terminated": int(terminations[env_index]),
+                            "solved": int(
+                                int(infos["end_status"][env_index]) == TASK_SUCCESSFUL
+                            ),
                             "mean_option_duration": episodic_length / max(episode_decisions, 1),
                         }
                     )

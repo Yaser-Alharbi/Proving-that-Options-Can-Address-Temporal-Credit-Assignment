@@ -75,8 +75,7 @@ class Sweep:
     seeds: Tuple[int, ...] = (0, 1, 2)
     threshold: Optional[Union[float, Dict[str, float]]] = None
     """episodic return plot.py times the crossing of, where this environment's
-    asymptote puts its own default out of reach. A mapping sets it per condition,
-    for an environment where one bar cannot sit inside both arms' learning ranges"""
+    asymptote puts the default out of reach; a mapping sets it per condition."""
     reward_delays: Tuple[int, ...] = ()
     """empty uses `base.reward_delay`, so a sweep that does not name this stays one cell"""
     discounts: Tuple[str, ...] = ()
@@ -263,8 +262,7 @@ THRESHOLDS: Dict[Tuple[str, str], Union[float, Dict[str, float]]] = {
     for sweep in SWEEPS.values()
     if sweep.threshold is not None
 }
-"""What plot.py reads a declared threshold by: the pair a run group's name is built from.
-A mapping value is keyed by condition and resolved in `plot.threshold_for`."""
+# Keys are (env_id, tag); value may be a per-condition dict, see plot.threshold_for.
 
 
 @dataclass(frozen=True)
@@ -326,9 +324,7 @@ class Cell:
 def expand(sweep: Sweep) -> Iterator[Cell]:
     """Every cell of a sweep: `action` once, the rest per family, count and draw.
 
-    An empty `reward_delays`, `discounts`, `gammas` or `max_steps_values` uses
-    the value on `base`. The `action` condition takes only the first discount
-    mode, being invariant to the axis.
+    Empty fields use `base`; `action` takes only the first discount mode.
     """
     delays = sweep.reward_delays or (sweep.base.reward_delay,)
     modes = sweep.discounts or (sweep.base.discount,)

@@ -60,6 +60,10 @@ def make_vector(num_envs: int, k: int, async_mode: bool) -> gym.vector.VectorEnv
                 gamma=0.999,
                 max_episode_steps=100_000,
                 clip_reward=True,
+                n_options=64,
+                option_family="grammar",
+                option_seed=0,
+                reward_delay=0,
             )()
             return RepeatSteps(env, k) if k > 1 else env
 

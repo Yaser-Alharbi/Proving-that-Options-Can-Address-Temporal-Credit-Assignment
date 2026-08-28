@@ -20,12 +20,25 @@ def main() -> None:
     parser.add_argument("--env-id", default="NetHackChallenge-v0")
     parser.add_argument("--steps", type=int, default=10000)
     parser.add_argument("--condition", default="option", choices=["action", "option", "both"])
+    parser.add_argument("--n-options", type=int, default=64)
+    parser.add_argument(
+        "--option-family",
+        default="grammar",
+        choices=["grammar", "grammar_depth", "random"],
+    )
+    parser.add_argument("--option-seed", type=int, default=0)
     parser.add_argument("--max-episode-steps", type=int, default=100_000)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
     raw = gym.make(args.env_id)
-    sequences, names, required_slots = make_options(raw.unwrapped.actions, args.condition)
+    sequences, names, required_slots = make_options(
+        raw.unwrapped.actions,
+        args.condition,
+        args.n_options,
+        args.option_family,
+        args.option_seed,
+    )
     gated = sum(slot is not None for slot in required_slots)
     print(f"n primitive actions: {raw.action_space.n}")
     print(
@@ -42,6 +55,10 @@ def main() -> None:
         gamma=0.999,
         max_episode_steps=args.max_episode_steps,
         clip_reward=True,
+        n_options=args.n_options,
+        option_family=args.option_family,
+        option_seed=args.option_seed,
+        reward_delay=0,
     )()
     _, info = env.reset(seed=args.seed)
 

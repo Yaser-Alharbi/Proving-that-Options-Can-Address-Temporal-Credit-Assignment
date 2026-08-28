@@ -8,7 +8,7 @@ autoreset puts its phantom transition, and how wide the glyph embedding has to
 be. Both are silent if wrong.
 """
 
-from typing import List, Tuple
+from typing import Callable, List, Tuple
 
 import gymnasium as gym
 import numpy as np
@@ -22,6 +22,26 @@ NUM_ENVS = 2
 TRUNCATE_AT = 20
 CONSTANT_ACTION = 0
 INVENTORY_LENGTH = 55
+FULL_CATALOGUE = 188
+"""Every row `NetHackChallenge-v0`'s action set admits, so no test here is
+subsampling the catalogue while checking something else."""
+
+
+def env_thunk(idx: int, condition: str = "action") -> Callable[[], gym.Env]:
+    """One env of the vector, truncating at `TRUNCATE_AT`."""
+    return make_env(
+        env_id="NetHackChallenge-v0",
+        seed=0,
+        idx=idx,
+        condition=condition,
+        gamma=0.999,
+        max_episode_steps=TRUNCATE_AT,
+        clip_reward=True,
+        n_options=FULL_CATALOGUE,
+        option_family="grammar",
+        option_seed=0,
+        reward_delay=0,
+    )
 
 
 @pytest.fixture(scope="module")
@@ -32,18 +52,7 @@ def truncating_rollout() -> List[Tuple[np.ndarray, np.ndarray, np.ndarray, dict]
     rather than a property of how long a random character survives.
     """
     envs = gym.vector.SyncVectorEnv(
-        [
-            make_env(
-                env_id="NetHackChallenge-v0",
-                seed=0,
-                idx=index,
-                condition="action",
-                gamma=0.999,
-                max_episode_steps=TRUNCATE_AT,
-                clip_reward=True,
-            )
-            for index in range(NUM_ENVS)
-        ],
+        [env_thunk(index) for index in range(NUM_ENVS)],
         autoreset_mode=gym.vector.AutoresetMode.NEXT_STEP,
     )
     envs.reset(seed=0)
@@ -95,15 +104,7 @@ def test_observation_space_matches_encoder_assumptions() -> None:
     the top glyph. This asserts the premise of that fix rather than the fix, so it
     fails if an NLE version ever makes the bound exclusive.
     """
-    env = make_env(
-        env_id="NetHackChallenge-v0",
-        seed=0,
-        idx=0,
-        condition="action",
-        gamma=0.999,
-        max_episode_steps=TRUNCATE_AT,
-        clip_reward=True,
-    )()
+    env = env_thunk(0)()
     glyphs = env.observation_space["glyphs"]
     env.close()
 
@@ -119,15 +120,7 @@ def test_observation_space_matches_encoder_assumptions() -> None:
 
 def test_reset_emits_zero_primitive_steps_and_a_mask() -> None:
     """The contract the trainer asserts on: reset reports steps=0 and a full mask."""
-    env = make_env(
-        env_id="NetHackChallenge-v0",
-        seed=0,
-        idx=0,
-        condition="action",
-        gamma=0.999,
-        max_episode_steps=TRUNCATE_AT,
-        clip_reward=True,
-    )()
+    env = env_thunk(0)()
     _, info = env.reset(seed=0)
     n_actions = env.action_space.n
     env.close()
@@ -149,7 +142,9 @@ def test_initiation_excludes_rows_naming_an_empty_inventory_slot() -> None:
         observation_keys=OBSERVATION_KEYS,
         max_episode_steps=TRUNCATE_AT,
     )
-    sequences, names, required_slots = make_options(env.unwrapped.actions, "option")
+    sequences, names, required_slots = make_options(
+        env.unwrapped.actions, "option", FULL_CATALOGUE, "grammar", 0
+    )
     wrapper = OptionWrapper(env, sequences, required_slots, gamma=0.999)
 
     empty_pack = np.zeros(INVENTORY_LENGTH, dtype=np.uint8)

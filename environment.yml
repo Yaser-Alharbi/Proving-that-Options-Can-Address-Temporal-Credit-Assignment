@@ -4,8 +4,15 @@ channels:
 dependencies:
   - python=3.11
   - pip
+  # nle builds from source and none of these are installable without root
+  - cmake
+  - cxx-compiler
+  - bison
+  - flex
   - pip:
-      # src/ (NetHack, PyTorch)
+      # src/ (NetHack, PyTorch). Check turin's driver with nvidia-smi and match
+      # the cu version; cu124 works with driver 550+.
+      - --extra-index-url https://download.pytorch.org/whl/cu124
       - torch
       - minigrid
       - gymnasium

@@ -1,52 +1,46 @@
+from typing import Callable, Literal
+
 import gymnasium as gym
 import nle  # noqa: F401  registers NetHack envs with gymnasium
-import numpy as np
-from nle import nethack
 
 from options import OptionWrapper, make_options
 
-MAP_H, MAP_W = 21, 79
-CROP = 9
-N_STATS = 27
+OBSERVATION_KEYS = ("glyphs", "blstats", "inv_letters")
+"""Wider than the encoder consumes: `inv_letters` decides the initiation sets."""
 
-MAP_SIZE = MAP_H * MAP_W
-CROP_SIZE = CROP * CROP
-OBS_SIZE = MAP_SIZE + CROP_SIZE + N_STATS
+REWARD_CLIP = 1.0
 
 
-class NLEObsWrapper(gym.ObservationWrapper):
-    """Flatten NLE's dict observation into full map | agent-centred crop | stats"""
+def make_env(
+    env_id: str,
+    seed: int,
+    idx: int,
+    condition: Literal["action", "option", "both"],
+    gamma: float,
+    max_episode_steps: int,
+    clip_reward: bool,
+) -> Callable[[], gym.Env]:
+    """Return a thunk building one NLE env that satisfies the trainer's contract."""
 
-    def __init__(self, env):
-        super().__init__(env)
-        self.observation_space = gym.spaces.Box(
-            0.0, float(nethack.MAX_GLYPH), (OBS_SIZE,), np.float32
+    def thunk() -> gym.Env:
+        env = gym.make(
+            env_id,
+            observation_keys=OBSERVATION_KEYS,
+            max_episode_steps=max_episode_steps,
         )
-        self.pad = CROP // 2
-
-    def observation(self, obs):
-        glyphs = obs["glyphs"]
-        blstats = obs["blstats"]
-
-        x, y = int(blstats[0]), int(blstats[1])
-        padded = np.pad(glyphs, self.pad, mode="constant")
-        crop = padded[y : y + CROP, x : x + CROP]
-
-        return np.concatenate([
-            glyphs.ravel().astype(np.float32),
-            crop.ravel().astype(np.float32),
-            blstats.astype(np.float32),
-        ])
-
-
-def make_env(env_id, seed, idx, use_options, gamma=0.99):
-    def thunk():
-        env = gym.make(env_id)
-        if use_options:
-            options, _ = make_options(env.unwrapped.actions)
-            env = OptionWrapper(env, options, gamma=gamma)
-        env = NLEObsWrapper(env)
+        # innermost, so `l` counts primitive steps and `r` sums raw undiscounted
+        # reward. Above the clip or the option wrapper it would instead report
+        # decisions and a discounted sum, which are different quantities in the
+        # option condition than in the action condition and so not comparable.
         env = gym.wrappers.RecordEpisodeStatistics(env)
+        if clip_reward:
+            # below OptionWrapper, so the clip applies per primitive step rather
+            # than to an option's discounted sum. Clipping the decision reward
+            # would be a different transformation for a 16-step option than for
+            # a primitive.
+            env = gym.wrappers.ClipReward(env, -REWARD_CLIP, REWARD_CLIP)
+        sequences, _, required_slots = make_options(env.unwrapped.actions, condition)
+        env = OptionWrapper(env, sequences, required_slots, gamma=gamma)
         env.reset(seed=seed + idx)
         return env
 

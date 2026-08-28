@@ -10,7 +10,7 @@ import json
 import pathlib
 import sys
 from dataclasses import dataclass
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -64,14 +64,8 @@ CENSOR_FRACTION = 0.5
 BASE_DELAY = 0
 """The delay `delay_advantage` normalises to, where the treatment is off."""
 
-RATIO_CONDITIONS: Tuple[str, str] = ("action", "option")
-"""Numerator and denominator of the advantage ratio, in that order."""
-
 NO_INTERACTION = 1.0
 """Normalised advantage where delay changed nothing; the line the figure is read against."""
-
-RATIO_COLOR = "#8172b3"
-"""A ratio belongs to no single condition, so it takes a colour none of them uses."""
 
 DISCOUNT_ORDER: Tuple[str, ...] = ("decision", "primitive")
 """Panel order, decision first: it is the `Args` default and every other experiment's arm."""
@@ -381,11 +375,16 @@ def aggregate_final(data: Inputs, frame: pd.DataFrame, rng: np.random.Generator)
     return estimate(np.asarray(values), np.asarray(strata), data.args.resamples, rng)
 
 def threshold_for(data: Inputs, cell: pd.DataFrame) -> float:
-    """`--threshold`, else what this cell's sweep declared, else `DEFAULT_THRESHOLD`."""
-    if data.args.threshold is not None:
-        return float(data.args.threshold)
+    """Threshold for this cell: `--threshold`, sweep's declared value, or `DEFAULT_THRESHOLD`."""
     first = cell.iloc[0]
-    return THRESHOLDS.get((first.env_id, first.tag), DEFAULT_THRESHOLD)
+    for declared in (data.args.threshold,
+                     THRESHOLDS.get((first.env_id, first.tag), DEFAULT_THRESHOLD)):
+        if isinstance(declared, dict):
+            if first.condition in declared:
+                return float(declared[first.condition])
+        elif declared is not None:
+            return float(declared)
+    return DEFAULT_THRESHOLD
 
 def cell_crossings(data: Inputs, cell: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
     """One cell's per-seed crossing steps, NaN where a seed never crossed, and each stratum."""
@@ -451,6 +450,15 @@ def shared_estimate(table: pd.DataFrame) -> str:
         return ""
     method = str(table.method.iloc[0])
     return f"{int(table.n_seeds.iloc[0])} seeds, {METHOD_PHRASE.get(method, method)}"
+
+def threshold_phrase(table: pd.DataFrame) -> str:
+    """`threshold x`, or one bar per condition where the conditions were given their own."""
+    bars = {str(row.condition): float(row.threshold) for _, row in table.iterrows()}
+    if len(set(bars.values())) == 1:
+        return f"threshold {next(iter(bars.values())):g}"
+    return "threshold " + ", ".join(
+        f"{value:g} for {CONDITION_LABEL[condition]}"
+        for condition, value in sorted(bars.items(), key=lambda pair: -pair[1]))
 
 def limit_span(table: pd.DataFrame) -> str:
     """The range of per-cell truncation limits, as one number where they agree."""
@@ -531,6 +539,21 @@ def draw_bands(axis: Axes, table: pd.DataFrame, varying: Sequence[str],
         axis.fill_between(group.primitive_step, group.low, group.high, color=color,
                           alpha=DRAW_BAND_ALPHA if seed_colors is not None else BAND_ALPHA,
                           linewidth=0, edgecolor="none")
+
+def shared_across_modes(table: pd.DataFrame) -> pd.DataFrame:
+    """The action arm repeated into every discount mode present, where it was run in one.
+
+    `expand` does not cross the action condition with `discount`, because a primitive takes
+    one step per decision and `gamma ** 1` is `gamma`, so the two modes would be the same
+    run twice. The one cell is the correct reference for both panels, which is what this
+    puts there; a sweep that did run the action arm per mode is left alone.
+    """
+    modes = set(table.discount)
+    action = table[table.condition == "action"]
+    if len(modes) < 2 or action.empty or action.discount.nunique() > 1:
+        return table
+    missing = [action.assign(discount=mode) for mode in modes - set(action.discount)]
+    return pd.concat([table, *missing], ignore_index=True)
 
 def delay_varying(table: pd.DataFrame) -> List[str]:
     """What names a series on a delay figure: the condition, then anything else that varies.
@@ -672,6 +695,15 @@ def omitted_note(data: Inputs, frame: pd.DataFrame, table: pd.DataFrame) -> str:
     rows = data.episodes[data.episodes.condition.isin(absent)]
     return (f"{labels_for(absent)} omitted: terminated {rows.terminated.mean():.2%} "
             "of episodes, over no step range every seed covers")
+
+def never_crossed(table: pd.DataFrame) -> str:
+    """Conditions censored in every cell of a `steps_to_threshold` table."""
+    floored = [condition for condition, rows in table.groupby("condition")
+               if rows.point.isna().all()]
+    if not floored:
+        return ""
+    return (f"{labels_for(floored)} censored at every delay: never reached the "
+            "threshold, so this is a capability floor and not a slower crossing")
 
 def curve_figure(data: Inputs, frame: pd.DataFrame, column: str,
                  ylabel: str) -> Tuple[Figure, pd.DataFrame]:
@@ -940,7 +972,7 @@ def threshold_table(data: Inputs) -> Tuple[Figure, pd.DataFrame]:
     caption = caption_for(table, varying)
     # tight_layout ignores suptitle; a caption at y=1 sits in the title's band
     figure.tight_layout(rect=[0.0, 0.0, 1.0, 0.84 if caption else 0.92])
-    figure.suptitle(f"primitive steps to episodic return {table.threshold.iloc[0]:g} "
+    figure.suptitle(f"primitive steps to episodic return, {threshold_phrase(table)} "
                     f"({data.args.window}-episode moving average)",
                     x=0.0, y=0.99, ha="left")
     if caption:
@@ -954,7 +986,8 @@ def delay_crossing_fraction(data: Inputs) -> Tuple[Figure, pd.DataFrame]:
         data.episodes,
         ("primitive_step", "episodic_return", "reward_delay", "discount"), "crossing fraction"
     )
-    table = steps_to_threshold(data, frame, np.random.default_rng(BOOTSTRAP_SEED))
+    table = shared_across_modes(
+        steps_to_threshold(data, frame, np.random.default_rng(BOOTSTRAP_SEED)))
     table["crossed_fraction"] = table.n_crossed / table.n_seeds
     varying = delay_varying(table)
     figure, axes, modes = discount_axes(table)
@@ -965,10 +998,11 @@ def delay_crossing_fraction(data: Inputs) -> Tuple[Figure, pd.DataFrame]:
                      label=f"censoring rule ({CENSOR_FRACTION:.0%} of seeds)")
     axes[0][0].set_ylabel("seeds reaching the threshold")
     axes[0][0].set_ylim(*FRACTION_YLIM)
-    finish(figure, list(axes.flat), environments(frame),
-           caption_for(table, varying,
-                       (f"threshold {table.threshold.iloc[0]:g}, "
-                        f"{data.args.window}-episode moving average",)))
+    finish(figure, list(axes.flat), environments(frame), "\n".join(filter(None, [
+        caption_for(table, varying, (f"{threshold_phrase(table)}, "
+                                     f"{data.args.window}-episode moving average",)),
+        never_crossed(table),
+    ])))
     return figure, table
 
 def delay_slack(data: Inputs) -> Tuple[Figure, pd.DataFrame]:
@@ -1006,7 +1040,7 @@ def delay_slack(data: Inputs) -> Tuple[Figure, pd.DataFrame]:
     if not rows:
         raise MissingData("no cell solved an episode in the tail of any seed")
 
-    table = pd.DataFrame(rows)
+    table = shared_across_modes(pd.DataFrame(rows))
     varying = delay_varying(table)
     figure, axes, modes = discount_axes(table, nrows=2)
     for column, mode in enumerate(modes):
@@ -1033,7 +1067,8 @@ def delay_sweep(data: Inputs) -> Tuple[Figure, pd.DataFrame]:
         data.episodes,
         ("primitive_step", "episodic_return", "reward_delay", "discount"), "delay sweep"
     )
-    table = steps_to_threshold(data, frame, np.random.default_rng(BOOTSTRAP_SEED))
+    table = shared_across_modes(
+        steps_to_threshold(data, frame, np.random.default_rng(BOOTSTRAP_SEED)))
     censored = int(table.point.isna().sum())
     if censored == len(table):
         raise MissingData(f"every cell is censored at threshold "
@@ -1044,10 +1079,11 @@ def delay_sweep(data: Inputs) -> Tuple[Figure, pd.DataFrame]:
         delay_series(axis, table[table.discount == mode], "point", ("low", "high"), varying)
     axes[0][0].set_ylabel("primitive steps to threshold")
     finish(figure, list(axes.flat), environments(frame), "\n".join(filter(None, [
-        caption_for(table, varying, (f"threshold {table.threshold.iloc[0]:g}, "
+        caption_for(table, varying, (f"{threshold_phrase(table)}, "
                                      f"{data.args.window}-episode moving average",)),
         f"{censored} of {len(table)} cells censored, leaving a gap: fewer than "
         f"{CENSOR_FRACTION:.0%} of their seeds crossed" if censored else "",
+        never_crossed(table),
     ])))
     return figure, table
 
@@ -1067,87 +1103,69 @@ def advantage_records(data: Inputs, frame: pd.DataFrame) -> Dict[Tuple[str, int,
         crossings, strata = cell_crossings(data, cell)
         crossed = np.isfinite(crossings)
         records[key] = {"cell": name, "group": cell.group.iloc[0], **identity,
+                        "threshold": threshold_for(data, cell),
                         "n_crossed": int(crossed.sum()), "n_seeds": crossings.size,
                         "crossings": crossings[crossed], "strata": strata[crossed]}
     return records
 
-def advantage_ratio(data: Inputs, records: Dict[Tuple[str, int, str], Dict[str, object]],
-                    mode: str, delay: int, rng: np.random.Generator
-                    ) -> Optional[Tuple[float, np.ndarray, List[Dict[str, object]]]]:
-    """The action / option ratio at one delay, its bootstrap replicates, and the two cells."""
-    pair = [records.get((mode, delay, condition)) for condition in RATIO_CONDITIONS]
-    if any(cell is None
-           or cell["n_crossed"] < CENSOR_FRACTION * cell["n_seeds"] for cell in pair):
-        return None
-    points, draws = zip(*(resampled_points(cell["crossings"], cell["strata"],
-                                           data.args.resamples, rng) for cell in pair))
-    return points[0] / points[1], draws[0] / draws[1], list(pair)
-
 def delay_advantage(data: Inputs) -> Tuple[Figure, pd.DataFrame]:
-    """Action / option steps to threshold against delay, normalised to 1 at delay 0."""
+    """Steps to threshold against delay, each condition over its own crossing at delay 0.
+
+    Normalising inside a condition rather than across the two is what lets the arms be
+    compared where they hold different thresholds: each line is in units of its own delay-0
+    crossing, so the y axis is how many times delay slowed that arm down.
+    """
     frame = require_columns(
         data.episodes,
         ("primitive_step", "episodic_return", "reward_delay", "discount"), "advantage"
     )
     rng = np.random.default_rng(BOOTSTRAP_SEED)
     records = advantage_records(data, frame)
+    # every cell estimated once, so dividing the base delay by itself is exactly one with
+    # no interval, and every other delay carries the base's own error through the quotient
+    estimates = {key: resampled_points(record["crossings"], record["strata"],
+                                       data.args.resamples, rng)
+                 for key, record in records.items()
+                 if record["n_crossed"] >= CENSOR_FRACTION * record["n_seeds"]}
     rows = []
-    for mode in [mode for mode in DISCOUNT_ORDER if any(key[0] == mode for key in records)]:
-        delays = sorted({key[1] for key in records if key[0] == mode})
-        ratios = {delay: advantage_ratio(data, records, mode, delay, rng)
-                  for delay in delays}
-        base = ratios.get(BASE_DELAY)
+    for (mode, delay, condition), (point, draws) in estimates.items():
+        base = estimates.get((mode, BASE_DELAY, condition))
         if base is None:
-            warn(f"delay_advantage drops discount={mode}: its delay {BASE_DELAY} ratio is "
-                 "undefined, so there is nothing to normalise to")
+            if delay != BASE_DELAY:
+                warn(f"delay_advantage drops {condition} at discount={mode}: its delay "
+                     f"{BASE_DELAY} cell is censored, so there is nothing to normalise to")
             continue
-        base_point, base_draws, _ = base
-        for delay, ratio in ratios.items():
-            if ratio is None:
-                continue
-            point, draws, pair = ratio
-            # the ratio at the base delay is resampled inside each replicate, so the
-            # normalisation carries its own error rather than being treated as exact
-            normalised = draws / base_draws
-            low, high = np.quantile(normalised, [CI_ALPHA / 2, 1 - CI_ALPHA / 2])
-            crossed = min(int(cell["n_crossed"]) for cell in (*pair, *base[2]))
-            rows.append({
-                "group": pair[0]["group"], "env_id": pair[0]["env_id"],
-                "condition": " ÷ ".join(RATIO_CONDITIONS), "discount": mode,
-                "reward_delay": delay, "tag": pair[0]["tag"], "ratio": point,
-                "point": point / base_point, "low": float(low), "high": float(high),
-                "method": ("iqm-bootstrap" if crossed >= MIN_SEEDS_FOR_IQM
-                           else "median-bootstrap"),
-                "cells": " ".join(str(cell["cell"]) for cell in pair),
-                "n_crossed": min(int(cell["n_crossed"]) for cell in pair),
-                "n_seeds": min(int(cell["n_seeds"]) for cell in pair),
-            })
+        base_point, base_draws = base
+        low, high = np.quantile(draws / base_draws, [CI_ALPHA / 2, 1 - CI_ALPHA / 2])
+        record, base_record = records[(mode, delay, condition)], \
+            records[(mode, BASE_DELAY, condition)]
+        crossed = min(int(record["n_crossed"]), int(base_record["n_crossed"]))
+        rows.append({
+            "cell": record["cell"], "group": record["group"], "env_id": record["env_id"],
+            "condition": condition, "discount": mode, "reward_delay": delay,
+            "tag": record["tag"], "threshold": record["threshold"], "steps": point,
+            "point": point / base_point, "low": float(low), "high": float(high),
+            "method": ("iqm-bootstrap" if crossed >= MIN_SEEDS_FOR_IQM
+                       else "median-bootstrap"),
+            "n_crossed": int(record["n_crossed"]), "n_seeds": int(record["n_seeds"]),
+        })
     if not rows:
-        raise MissingData(
-            f"no discount mode has both {' and '.join(RATIO_CONDITIONS)} uncensored at "
-            f"delay {BASE_DELAY} and at one other delay"
-        )
+        raise MissingData(f"no condition is uncensored at delay {BASE_DELAY}, so no series "
+                          "has a base to normalise to")
 
-    table = pd.DataFrame(rows)
+    table = shared_across_modes(pd.DataFrame(rows))
     varying = delay_varying(table)
     figure, axes, modes = discount_axes(table)
     for axis, mode in zip(axes[0], modes):
-        panel = table[table.discount == mode].sort_values("reward_delay")
-        axis.errorbar(
-            panel.reward_delay, panel.point,
-            yerr=np.clip([panel.point - panel.low, panel.high - panel.point], 0, None),
-            color=RATIO_COLOR, marker="o", capsize=ERROR_CAP_SIZE, linewidth=LINE_WIDTH,
-            label=f"{' ÷ '.join(RATIO_CONDITIONS)} steps to threshold",
-        )
+        delay_series(axis, table[table.discount == mode], "point", ("low", "high"), varying)
         axis.axhline(NO_INTERACTION, color=REFERENCE_COLOR, linestyle=BASELINE_DASH,
-                     linewidth=REFERENCE_WIDTH, label="no interaction")
+                     linewidth=REFERENCE_WIDTH, label="no slowdown")
     axes[0][0].set_ylabel(f"steps to threshold, relative to delay {BASE_DELAY}")
     # only where the arms disagree: `caption_for` names a method the whole table shares
     methods = "" if shared_estimate(table) else " / ".join(
         sorted({METHOD_PHRASE.get(method, method) for method in table.method}))
     finish(figure, list(axes.flat), environments(frame),
-           caption_for(table, varying,
-                       (methods, "a delay with either condition censored is absent")))
+           caption_for(table, varying, (threshold_phrase(table), methods)))
     return figure, table
 
 def duration_vs_delay(data: Inputs) -> Tuple[Figure, pd.DataFrame]:
@@ -1233,6 +1251,16 @@ def selected(args: argparse.Namespace, resolved: Sequence[str]) -> List[str]:
             if (name in args.only if args.only else name in resolved)
             and name not in (args.skip or [])]
 
+def condition_threshold(text: str) -> Union[float, Dict[str, float]]:
+    """A bare threshold, or `condition=value` for one condition alone."""
+    if "=" not in text:
+        return float(text)
+    condition, _, value = text.partition("=")
+    if condition not in CONDITION_LABEL:
+        raise argparse.ArgumentTypeError(
+            f"{condition!r} is not a condition: {', '.join(CONDITION_LABEL)}")
+    return {condition: float(value)}
+
 def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     """Parse the command line."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -1243,8 +1271,9 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--bins", type=int, default=200)
     parser.add_argument("--window", type=int, default=100)
     parser.add_argument("--tail", type=float, default=0.1)
-    parser.add_argument("--threshold", type=float,
-                        help=f"overrides the sweep's, default {DEFAULT_THRESHOLD:g}")
+    parser.add_argument("--threshold", type=condition_threshold,
+                        help=f"overrides the sweep's, default {DEFAULT_THRESHOLD:g}; "
+                             "`option=0.99` overrides one condition and leaves the rest")
     parser.add_argument("--resamples", type=int, default=2000)
     return parser.parse_args(argv)
 

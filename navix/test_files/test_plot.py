@@ -1,7 +1,7 @@
 """Tests for the aggregation core of `plot.py`, on hand-built inputs."""
 
 import argparse
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -14,6 +14,7 @@ from plot import (
     CENSOR_FRACTION,
     CONDITION_COLOR,
     CONDITION_LABEL,
+    DEFAULT_THRESHOLD,
     GRAMMAR_COLOR,
     MIN_SEEDS_FOR_IQM,
     NO_INTERACTION,
@@ -22,6 +23,7 @@ from plot import (
     apply_x_scale,
     bootstrap_indices,
     collinear,
+    condition_threshold,
     count_overlay,
     crossing_step,
     delay_advantage,
@@ -32,10 +34,13 @@ from plot import (
     duration_vs_delay,
     estimate,
     iqm,
+    never_crossed,
     return_curve,
     series_label,
     settled_steps,
+    shared_across_modes,
     steps_to_threshold,
+    threshold_for,
     varying_fields,
 )
 
@@ -167,9 +172,9 @@ def delay_episodes() -> pd.DataFrame:
                 ]
     return pd.concat(frames, ignore_index=True)
 
-def delay_args() -> argparse.Namespace:
+def delay_args(threshold: Union[float, Dict[str, float]] = 0.5) -> argparse.Namespace:
     """Options a delay figure reads, with smoothing switched off."""
-    return argparse.Namespace(bins=GRID_POINTS, window=1, threshold=0.5,
+    return argparse.Namespace(bins=GRID_POINTS, window=1, threshold=threshold,
                               resamples=RESAMPLES, tail=DELAY_TAIL)
 
 def without_crossings(frame: pd.DataFrame, condition: str, delay: int,
@@ -440,6 +445,15 @@ def test_delay_slack_separates_compression_from_the_solve_length() -> None:
     )
     plt.close(figure)
 
+def test_delay_slack_repeats_a_discount_free_action_arm() -> None:
+    """`expand` runs the action arm in one mode, and both slack panels still need it."""
+    episodes = delay_episodes()
+    one_mode = episodes[(episodes.condition == "option") | (episodes.discount == "decision")]
+    figure, table = delay_slack(Inputs(one_mode, pd.DataFrame(), delay_args()))
+    for mode in DELAY_DISCOUNTS:
+        assert set(table[table.discount == mode].condition) == {"action", "option"}
+    plt.close(figure)
+
 def test_delay_sweep_leaves_a_gap_where_a_cell_is_censored() -> None:
     """A censored cell keeps its row but is not drawn, so the line stops rather than dipping."""
     frame = without_crossings(delay_episodes(), "action", 32, range(1, DELAY_SEEDS))
@@ -455,18 +469,79 @@ def test_delay_sweep_leaves_a_gap_where_a_cell_is_censored() -> None:
         assert drawn[CONDITION_LABEL["option"]] == list(DELAY_DELAYS)
     plt.close(figure)
 
+def test_threshold_for_resolves_a_bar_per_condition() -> None:
+    """A mapping gives each arm its own bar; a bare override still replaces both."""
+    frame = delay_episodes()
+    action = frame[frame.condition == "action"]
+    option = frame[frame.condition == "option"]
+    mapped = Inputs(frame, pd.DataFrame(),
+                    delay_args(threshold={"action": 0.15, "option": 0.95}))
+    assert threshold_for(mapped, action) == pytest.approx(0.15)
+    assert threshold_for(mapped, option) == pytest.approx(0.95)
+    # an override naming one condition leaves the other to fall through to the default
+    partial = Inputs(frame, pd.DataFrame(), delay_args(threshold={"option": 0.99}))
+    assert threshold_for(partial, option) == pytest.approx(0.99)
+    assert threshold_for(partial, action) == pytest.approx(DEFAULT_THRESHOLD)
+    bare = Inputs(frame, pd.DataFrame(), delay_args(threshold=0.3))
+    assert threshold_for(bare, action) == threshold_for(bare, option) == pytest.approx(0.3)
+
+def test_condition_threshold_parses_both_forms() -> None:
+    """`--threshold 0.5` is every condition; `--threshold option=0.99` is one of them."""
+    assert condition_threshold("0.5") == pytest.approx(0.5)
+    assert condition_threshold("option=0.99") == {"option": pytest.approx(0.99)}
+    with pytest.raises(argparse.ArgumentTypeError):
+        condition_threshold("options=0.99")
+
+def test_shared_across_modes_repeats_a_discount_free_action_arm() -> None:
+    """The action arm is run in one mode only, so one cell has to serve both panels."""
+    table = pd.DataFrame({
+        "cell": ["a", "o-dec", "o-prim"], "condition": ["action", "option", "option"],
+        "discount": ["decision", "decision", "primitive"], "reward_delay": [0, 0, 0],
+        "point": [100.0, 50.0, 50.0],
+    })
+    shared = shared_across_modes(table)
+    assert len(shared) == 4
+    for mode in ("decision", "primitive"):
+        panel = shared[shared.discount == mode]
+        assert set(panel.condition) == {"action", "option"}
+        assert panel[panel.condition == "action"].point.to_numpy() == pytest.approx(100.0)
+    # a sweep that did run the action arm per mode is left exactly as it was
+    assert shared_across_modes(shared).equals(shared)
+
+def test_never_crossed_names_only_a_condition_censored_at_every_delay() -> None:
+    """A condition censored everywhere is a capability floor; one censored at some delay is not."""
+    table = pd.DataFrame({
+        "condition": ["action", "action", "option", "option"],
+        "reward_delay": [0, 32, 0, 32],
+        "point": [np.nan, np.nan, float(CROSSING_STEP), np.nan],
+    })
+    note = never_crossed(table)
+    assert CONDITION_LABEL["action"] in note
+    assert CONDITION_LABEL["option"] not in note
+    assert never_crossed(table[table.condition == "option"]) == ""
+
 def test_delay_advantage_is_exactly_one_at_the_base_delay() -> None:
     """Normalising inside the replicate pins the base delay to one with no interval around it."""
     figure, table = delay_advantage(Inputs(delay_episodes(), pd.DataFrame(), delay_args()))
     base = table[table.reward_delay == BASE_DELAY]
     for column in ("point", "low", "high"):
         assert base[column].to_numpy() == pytest.approx(NO_INTERACTION)
-    delayed = table[table.reward_delay == 32]
-    ratio = CROSSING_AT[("action", 32)] / CROSSING_AT[("option", 32)]
-    assert delayed.ratio.to_numpy() == pytest.approx(ratio)
-    # the base ratio is one here, so the normalised point is the raw ratio
-    assert delayed.point.to_numpy() == pytest.approx(ratio)
     assert set(table.discount) == set(DELAY_DISCOUNTS)
+    plt.close(figure)
+
+def test_delay_advantage_normalises_each_condition_to_its_own_base() -> None:
+    """Each arm is in units of its own delay-0 crossing, so arms on different bars compare."""
+    figure, table = delay_advantage(Inputs(delay_episodes(), pd.DataFrame(), delay_args()))
+    delayed = table[table.reward_delay == 32].set_index("condition")
+    for condition in ("action", "option"):
+        slowdown = CROSSING_AT[(condition, 32)] / CROSSING_AT[(condition, 0)]
+        assert delayed.loc[condition, "point"].to_numpy() == pytest.approx(slowdown)
+        assert delayed.loc[condition, "steps"].to_numpy() == pytest.approx(
+            CROSSING_AT[(condition, 32)]
+        )
+    # the signature the figure exists to show: delay doubles action and leaves option alone
+    assert delayed.loc["action", "point"].to_numpy() == pytest.approx(2.0)
+    assert delayed.loc["option", "point"].to_numpy() == pytest.approx(NO_INTERACTION)
     plt.close(figure)
 
 def test_duration_vs_delay_excludes_the_action_condition() -> None:

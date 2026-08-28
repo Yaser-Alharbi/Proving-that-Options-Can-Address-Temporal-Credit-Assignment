@@ -17,7 +17,7 @@ import sys
 import time
 import traceback
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 from config import Args
 
@@ -73,13 +73,15 @@ class Sweep:
     option_seeds: Tuple[int, ...] = (0,)
     """draws of the `random` catalogue per count; `grammar` ignores the seed"""
     seeds: Tuple[int, ...] = (0, 1, 2)
-    threshold: Optional[float] = None
+    threshold: Optional[Union[float, Dict[str, float]]] = None
     """episodic return plot.py times the crossing of, where this environment's
-    asymptote puts its own default out of reach"""
+    asymptote puts its own default out of reach. A mapping sets it per condition,
+    for an environment where one bar cannot sit inside both arms' learning ranges"""
     reward_delays: Tuple[int, ...] = ()
     """empty uses `base.reward_delay`, so a sweep that does not name this stays one cell"""
     discounts: Tuple[str, ...] = ()
     gammas: Tuple[float, ...] = ()
+    max_steps_values: Tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         """Reject a bare string where a tuple of strings is meant."""
@@ -195,9 +197,9 @@ SWEEPS: Dict[str, Sweep] = {
     # inputs per group, and a figure panelled by `discount` needs to see both
     "exp4": Sweep(
         Args(
-            env_id="Navix-DoorKey-Random-16x16-v0",
-            max_forward=8,
-            max_steps=1200,
+            env_id="Navix-DoorKey-8x8-v0",
+            max_forward=4,
+            max_steps=400,
             budget=5_000_000,
             option_family="grammar",
             option_seed=0,
@@ -210,6 +212,39 @@ SWEEPS: Dict[str, Sweep] = {
         discounts=("decision", "primitive"),
         seeds=ANALYSIS_SEEDS,
         option_seeds=(0,),
+        # disjoint bands on this environment: a uniform policy over the catalogue already
+        # returns 0.8, so 0.15 times the instrument rather than the option arm's learning,
+        # and the action arm never reaches 0.5
+        threshold={"action": 0.15, "option": 0.95},
+    ),
+    # the two probes deciding where exp4 runs. Tagged outside the `exp4` prefix
+    # so `tag_figures` does not ask for the delay figures, which need a delay axis
+    "screen_keycorridor": Sweep(
+        Args(
+            env_id="Navix-KeyCorridorS6R3-v0",
+            max_steps=400,
+            budget=5_000_000,
+            tag="screen_keycorridor",
+        ),
+        conditions=("action",),
+        seeds=ANALYSIS_SEEDS,
+        threshold=0.15,
+    ),
+    "pin_probe": Sweep(
+        Args(
+            env_id="Navix-DoorKey-Random-16x16-v0",
+            max_forward=8,
+            budget=5_000_000,
+            option_family="grammar",
+            option_seed=0,
+            tag="pin_probe",
+        ),
+        conditions=("option",),
+        families=("grammar",),
+        n_options=(64,),
+        option_seeds=(0,),
+        max_steps_values=(400, 800, 1200),
+        seeds=ANALYSIS_SEEDS,
         threshold=0.15,
     ),
     "long-baseline": Sweep(
@@ -223,12 +258,13 @@ SWEEPS: Dict[str, Sweep] = {
     ),
 }
 
-THRESHOLDS: Dict[Tuple[str, str], float] = {
+THRESHOLDS: Dict[Tuple[str, str], Union[float, Dict[str, float]]] = {
     (sweep.base.env_id, sweep.base.tag): sweep.threshold
     for sweep in SWEEPS.values()
     if sweep.threshold is not None
 }
-"""What plot.py reads a declared threshold by: the pair a run group's name is built from."""
+"""What plot.py reads a declared threshold by: the pair a run group's name is built from.
+A mapping value is keyed by condition and resolved in `plot.threshold_for`."""
 
 
 @dataclass(frozen=True)
@@ -290,11 +326,14 @@ class Cell:
 def expand(sweep: Sweep) -> Iterator[Cell]:
     """Every cell of a sweep: `action` once, the rest per family, count and draw.
 
-    An empty `reward_delays`, `discounts` or `gammas` uses the value on `base`.
+    An empty `reward_delays`, `discounts`, `gammas` or `max_steps_values` uses
+    the value on `base`. The `action` condition takes only the first discount
+    mode, being invariant to the axis.
     """
     delays = sweep.reward_delays or (sweep.base.reward_delay,)
     modes = sweep.discounts or (sweep.base.discount,)
     gammas = sweep.gammas or (sweep.base.gamma,)
+    horizons = sweep.max_steps_values or (sweep.base.max_steps,)
     for condition in sweep.conditions:
         if condition == "action":
             variants: List[Dict[str, object]] = [{}]
@@ -312,8 +351,11 @@ def expand(sweep: Sweep) -> Iterator[Cell]:
                     }
                     for count, option_seed in itertools.product(sweep.n_options, seeds)
                 ]
-        for delay, mode, gamma, variant in itertools.product(
-            delays, modes, gammas, variants
+        # ppo.py raises gamma to the decision's primitive steps, which is 1 for a
+        # primitive, so an action cell computes the same discount in either mode
+        cell_modes = modes[:1] if condition == "action" else modes
+        for delay, mode, gamma, horizon, variant in itertools.product(
+            delays, cell_modes, gammas, horizons, variants
         ):
             yield Cell(
                 args=dataclasses.replace(
@@ -322,6 +364,7 @@ def expand(sweep: Sweep) -> Iterator[Cell]:
                     reward_delay=delay,
                     discount=mode,
                     gamma=gamma,
+                    max_steps=horizon,
                     **variant,
                 ),
                 seeds=sweep.seeds,

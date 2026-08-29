@@ -224,5 +224,5 @@ markdowns/
 plots/
 *.md
 *logs/
-
+*.sh
 

@@ -12,7 +12,7 @@ dependencies:
   - pip:
       # src/ (NetHack, PyTorch). Check turin's driver with nvidia-smi and match
       # the cu version; cu124 works with driver 550+.
-      - --extra-index-url https://download.pytorch.org/whl/cu124
+      - --extra-index-url https://download.pytorch.org/whl/cu128
       - torch
       - minigrid
       - gymnasium

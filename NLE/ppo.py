@@ -1,18 +1,23 @@
 # CleanRL ppo_atari.py. Budget/LR in primitive steps; initiation mask stored for the loss; SMDP gamma; NEXT_STEP phantom excluded.
+import atexit
 import csv
 import json
 import os
 import pathlib
 import random
+import signal
 import socket
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Sequence, Tuple
 
 import gymnasium as gym
 import nle
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -33,8 +38,8 @@ HIDDEN_DIM = 512
 CHECKPOINT_EVERY_FRAMES = 500_000
 """Checkpoint cadence in primitive steps. No resume: NLE env state is not serialised."""
 
-LOG_SCHEMA_VERSION = 2
-"""Bump on `EPISODE_COLUMNS` or the trace shard arrays."""
+LOG_SCHEMA_VERSION = 4
+"""Bump on `EPISODE_COLUMNS`, `TRACE_SCHEMA`, or `TERM_CAUSE_NAMES`."""
 
 BLSTATS_FIELDS = (
     ("score", nethack.NLE_BL_SCORE),
@@ -56,6 +61,28 @@ BLSTATS_PEAK_FIELDS = ("score", "dlvl", "xp_level", "xp_points", "gold")
 
 TRACE_BLSTATS_FIELDS = ("dlvl", "score", "hp", "time")
 """Trace columns from the pre-step observation (aligned with value/logprob)."""
+
+TRACE_DEVICE_FIELDS = (
+    "action",
+    "primitive_steps",
+    "done",
+    "reward",
+    "value",
+    "logprob",
+) + TRACE_BLSTATS_FIELDS
+"""Trace columns held on the device. Row order of `trace_device_columns`'s transfer."""
+
+TRACE_SCHEMA = pa.schema(
+    [
+        pa.field(name, pa.int32())
+        for name in ("global_step", "env_id", "action", "primitive_steps", "term_cause", "done")
+    ]
+    + [
+        pa.field(name, pa.float32())
+        for name in ("reward", "undiscounted_reward", "value", "logprob")
+    ]
+    + [pa.field(name, pa.int32()) for name in TRACE_BLSTATS_FIELDS]
+)
 
 MAX_TRACKED_DLVL = 64
 """Width of the per-episode depth mask. A deeper level is uncounted, not a resize."""
@@ -152,7 +179,9 @@ class Args:
     clip_reward: bool = True
     """clip reward to [-1, 1] per primitive step, before any option sums it"""
     log_trace: bool = True
-    """one shard per update, one row per `envs.step` (decisions, not primitives)"""
+    """one row per `envs.step` (decisions, not primitives)"""
+    trace_flush_iterations: int = 64
+    """rollout iterations per parquet row group. Not the optimizer-step `updates` counter."""
     checkpoint_keep: Literal["all", "endpoints"] = "endpoints"
     """`endpoints` is first, midpoint, last. `all` is every cadence hit."""
     directory: str = ""
@@ -218,6 +247,41 @@ def layer_init(layer: nn.Linear, std: float = np.sqrt(2), bias_const: float = 0.
 
 def masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return (x * mask).sum() / mask.sum().clamp(min=1.0)
+
+
+def trace_device_columns(
+    actions: torch.Tensor,
+    primitive_steps: torch.Tensor,
+    dones: torch.Tensor,
+    rewards: torch.Tensor,
+    values: torch.Tensor,
+    logprobs: torch.Tensor,
+    blstats: torch.Tensor,
+    blstats_indices: Sequence[int],
+) -> np.ndarray:
+    """`TRACE_DEVICE_FIELDS` as rows flattened step-major, in one host transfer.
+
+    Every column is float32, so all ten ride one `.cpu()` instead of costing a
+    device sync each. The caller's `trace_buffer` dtype does the int cast.
+    """
+    stacked = torch.cat(
+        [
+            actions.unsqueeze(0),
+            primitive_steps.unsqueeze(0),
+            dones.unsqueeze(0),
+            rewards.unsqueeze(0),
+            values.unsqueeze(0),
+            logprobs.unsqueeze(0),
+            blstats[:, :, blstats_indices].permute(2, 0, 1),
+        ]
+    )
+    assert stacked.dtype == torch.float32, (
+        f"one stacked transfer requires one dtype; got {stacked.dtype}"
+    )
+    assert stacked.shape[0] == len(TRACE_DEVICE_FIELDS), (
+        f"{stacked.shape[0]} rows for {len(TRACE_DEVICE_FIELDS)} named columns"
+    )
+    return stacked.reshape(len(TRACE_DEVICE_FIELDS), -1).cpu().numpy()
 
 
 def cell_identity(args: Args) -> Dict[str, object]:
@@ -526,9 +590,52 @@ if __name__ == "__main__":
         )
     )
 
-    trace_dir = run_dir / f"decisions_seed{args.seed}"
+    trace_part = 0
+    trace_filled = 0
+    trace_buffer: Dict[str, np.ndarray] = {}
+    trace_writer: Optional[pq.ParquetWriter] = None
     if args.log_trace:
-        trace_dir.mkdir(parents=True, exist_ok=True)
+        trace_capacity = args.trace_flush_iterations * args.num_steps * args.num_envs
+        trace_buffer = {
+            field.name: np.zeros(
+                trace_capacity,
+                dtype=np.int32 if pa.types.is_int32(field.type) else np.float32,
+            )
+            for field in TRACE_SCHEMA
+        }
+        trace_writer = pq.ParquetWriter(
+            run_dir / f"decisions_seed{args.seed}_part{trace_part:02d}.parquet",
+            TRACE_SCHEMA,
+            compression="zstd",
+            compression_level=3,
+        )
+
+        def flush_trace_row_group() -> None:
+            """Write the buffered decisions as one row group and empty the buffer."""
+            global trace_filled, trace_writer
+            if trace_filled == 0:
+                return
+            assert trace_writer is not None
+            trace_writer.write_batch(
+                pa.record_batch(
+                    [
+                        pa.array(trace_buffer[field.name][:trace_filled], type=field.type)
+                        for field in TRACE_SCHEMA
+                    ],
+                    schema=TRACE_SCHEMA,
+                )
+            )
+            trace_filled = 0
+
+        def close_trace() -> None:
+            """Flush the tail and write the parquet footer."""
+            global trace_writer
+            flush_trace_row_group()
+            if trace_writer is not None and trace_writer.is_open:
+                trace_writer.close()
+
+        atexit.register(close_trace)
+        signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(128 + signum))
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -872,24 +979,28 @@ if __name__ == "__main__":
             episode_rows.clear()
 
         if args.log_trace:
-            trace_blstats = obs["blstats"][:, :, trace_blstats_indices].cpu().numpy()
-            np.savez_compressed(
-                trace_dir / f"f{frames:09d}.npz",
-                global_step=trace_global_step.reshape(-1),
-                env_id=trace_env_id,
-                reward=rewards.cpu().numpy().reshape(-1).astype(np.float32),
-                undiscounted_reward=trace_undiscounted.reshape(-1),
-                action=actions.cpu().numpy().reshape(-1).astype(np.int32),
-                primitive_steps=primitive_steps.cpu().numpy().reshape(-1).astype(np.int32),
-                term_cause=trace_cause.reshape(-1),
-                done=dones.cpu().numpy().reshape(-1).astype(np.int32),
-                value=values.cpu().numpy().reshape(-1).astype(np.float32),
-                logprob=logprobs.cpu().numpy().reshape(-1).astype(np.float32),
-                **{
-                    name: trace_blstats[:, :, column].reshape(-1).astype(np.int32)
-                    for column, name in enumerate(TRACE_BLSTATS_FIELDS)
-                },
+            start = trace_filled
+            stop = start + args.num_steps * args.num_envs
+            assert stop <= trace_buffer["global_step"].size
+            transferred = trace_device_columns(
+                actions,
+                primitive_steps,
+                dones,
+                rewards,
+                values,
+                logprobs,
+                obs["blstats"],
+                trace_blstats_indices,
             )
+            trace_buffer["global_step"][start:stop] = trace_global_step.reshape(-1)
+            trace_buffer["env_id"][start:stop] = trace_env_id
+            trace_buffer["term_cause"][start:stop] = trace_cause.reshape(-1)
+            trace_buffer["undiscounted_reward"][start:stop] = trace_undiscounted.reshape(-1)
+            for row, name in enumerate(TRACE_DEVICE_FIELDS):
+                trace_buffer[name][start:stop] = transferred[row]
+            trace_filled = stop
+            if iteration % args.trace_flush_iterations == 0:
+                flush_trace_row_group()
 
         with torch.no_grad():
             next_value = agent.get_value(next_obs).reshape(1, -1)
@@ -1037,6 +1148,17 @@ if __name__ == "__main__":
 
         if frames - last_checkpoint_frames >= CHECKPOINT_EVERY_FRAMES:
             last_checkpoint_frames = frames
+            if args.log_trace:
+                flush_trace_row_group()
+                assert trace_writer is not None
+                trace_writer.close()
+                trace_part += 1
+                trace_writer = pq.ParquetWriter(
+                    run_dir / f"decisions_seed{args.seed}_part{trace_part:02d}.parquet",
+                    TRACE_SCHEMA,
+                    compression="zstd",
+                    compression_level=3,
+                )
             past_midpoint = frames >= args.budget // 2
             if (
                 args.checkpoint_keep == "all"
@@ -1056,9 +1178,6 @@ if __name__ == "__main__":
                 wrote_first_checkpoint = True
                 wrote_midpoint_checkpoint = wrote_midpoint_checkpoint or past_midpoint
 
-    if episode_rows:
-        csv_writer.writerows(episode_rows)
-        csv_file.flush()
     save_checkpoint(
         run_dir / f"checkpoint_seed{args.seed}_f{frames:09d}.pt",
         agent,

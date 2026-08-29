@@ -10,6 +10,10 @@ from nle.env.base import NLE
 MOVE_REPEATS = [1, 2, 4, 8, 16]
 """Reach ladder. Module constant: catalogue size is a function of the action set."""
 
+DETOUR_EPISODE_COST = 1
+"""Primitives one detour spends. NLE steps a neighbour in a single keystroke and
+the aim returns to the heading, so there is no turn to pay for either way."""
+
 COMPASS = [
     nethack.CompassDirection.N,
     nethack.CompassDirection.S,
@@ -96,6 +100,12 @@ NO_HEADING = -1
 COMPASS_OFFSETS = [(0, -1), (0, 1), (1, 0), (-1, 0), (1, -1), (-1, -1), (1, 1), (-1, 1)]
 """`(dx, dy)` per `COMPASS` entry. North is `dy == -1`: row 0 of `glyphs` is the top."""
 
+COMPASS_BEARING = (0, 180, 90, 270, 45, 315, 135, 225)
+"""Degrees clockwise from north per `COMPASS` entry. `COMPASS` is not in angular
+order, so `_reaim` cannot rank candidates by their index."""
+
+FULL_TURN_DEGREES = 360
+
 CMAP_OPEN_DOOR = (13, 14)
 CMAP_CLOSED_DOOR = (15, 16)
 """Vertical then horizontal. cmap 12 is a doorway, not a door."""
@@ -133,9 +143,20 @@ TERM_NONE = -1
 TERM_SEQUENCE = 0
 TERM_ENV_ABORT = 1
 TERM_EPISODE_END = 2
-TERM_INTERRUPT = 3
-TERM_CAUSE_NAMES = ("sequence", "env_abort", "episode_end", "interrupt")
-"""`interrupt` is beta firing on the state. `TERM_NONE` is the NEXT_STEP phantom."""
+TERM_BLOCKED = 3
+TERM_NO_HEADING = 4
+TERM_DETOUR = 5
+TERM_NO_PROMPT = 6
+TERM_CAUSE_NAMES = (
+    "sequence",
+    "env_abort",
+    "episode_end",
+    "blocked",
+    "no_heading",
+    "detour",
+    "no_prompt",
+)
+"""`TERM_NONE` is the NEXT_STEP phantom."""
 
 MISC_IN_YN = 0
 """`misc[0]`. Prompted catalogue commands raise this."""
@@ -171,6 +192,8 @@ class OptionRow(NamedTuple):
     effect: int
     heading: int
     """Index into `COMPASS`, or `NO_HEADING`."""
+    follow: int
+    """1 to re-aim around a blocked heading, 0 to let `beta` fire on it."""
 
     @property
     def keystrokes(self) -> Tuple[int, ...]:
@@ -183,25 +206,28 @@ def _catalogue(env_actions: Sequence[Any]) -> List[OptionRow]:
     index = {a: i for i, a in enumerate(env_actions)}
     rows: List[OptionRow] = []
 
-    for heading, direction in enumerate(COMPASS):
-        if direction not in index:
-            continue
-        for repeat in MOVE_REPEATS:
-            rows.append(
-                OptionRow(
-                    key=index[direction],
-                    name=f"move_{direction.name}_x{repeat}",
-                    slot=None,
-                    reach=repeat,
-                    group=GROUP_MOVE,
-                    argument=None,
-                    prompts=False,
-                    step_limit=repeat,
-                    requires=NEEDS_WALKABLE,
-                    effect=EFFECT_UNKNOWN,
-                    heading=heading,
+    for follow in (0, 1):
+        suffix = "+follow" if follow else ""
+        for heading, direction in enumerate(COMPASS):
+            if direction not in index:
+                continue
+            for repeat in MOVE_REPEATS:
+                rows.append(
+                    OptionRow(
+                        key=index[direction],
+                        name=f"move_{direction.name}_x{repeat}{suffix}",
+                        slot=None,
+                        reach=repeat,
+                        group=GROUP_MOVE,
+                        argument=None,
+                        prompts=False,
+                        step_limit=repeat * (1 + DETOUR_EPISODE_COST * follow),
+                        requires=NEEDS_WALKABLE,
+                        effect=EFFECT_UNKNOWN,
+                        heading=heading,
+                        follow=follow,
+                    )
                 )
-            )
 
     for command in SINGLE_COMMANDS:
         if command in index:
@@ -222,6 +248,7 @@ def _catalogue(env_actions: Sequence[Any]) -> List[OptionRow]:
                         else EFFECT_UNKNOWN
                     ),
                     heading=NO_HEADING,
+                    follow=0,
                 )
             )
 
@@ -246,6 +273,7 @@ def _catalogue(env_actions: Sequence[Any]) -> List[OptionRow]:
                         EFFECT_PUT if command == nethack.Command.DROP else EFFECT_UNKNOWN
                     ),
                     heading=NO_HEADING,
+                    follow=0,
                 )
             )
 
@@ -268,6 +296,7 @@ def _catalogue(env_actions: Sequence[Any]) -> List[OptionRow]:
                     requires=DIR_REQUIREMENT[command],
                     effect=DIR_EFFECT.get(command, EFFECT_UNKNOWN),
                     heading=heading,
+                    follow=0,
                 )
             )
 
@@ -275,19 +304,21 @@ def _catalogue(env_actions: Sequence[Any]) -> List[OptionRow]:
 
 
 def _class_rank(rows: Sequence[OptionRow]) -> Dict[str, int]:
-    """Position inside the row's group. Longest reach first, then catalogue order."""
-    keyed: Dict[int, List[Tuple[int, int, str]]] = {}
+    """Position inside the row's group. Following first, then longest reach, then catalogue order."""
+    keyed: Dict[int, List[Tuple[int, int, int, str]]] = {}
     for position, row in enumerate(rows):
-        keyed.setdefault(row.group, []).append((-row.reach, position, row.name))
+        keyed.setdefault(row.group, []).append(
+            (-row.follow, -row.reach, position, row.name)
+        )
     rank: Dict[str, int] = {}
     for group in keyed.values():
-        for place, (_, _, name) in enumerate(sorted(group)):
+        for place, (_, _, _, name) in enumerate(sorted(group)):
             rank[name] = place
     return rank
 
 
 def grammar_options(n: int, rows: Sequence[OptionRow]) -> List[OptionRow]:
-    """First n breadth-first: contingent last, then one per group, longest-reach first."""
+    """First n breadth-first: contingent last, then one per group, following and longest-reach first."""
     rank = _class_rank(rows)
     ordered = sorted(
         rows, key=lambda row: (row.slot is not None, rank[row.name], row.group)
@@ -296,9 +327,11 @@ def grammar_options(n: int, rows: Sequence[OptionRow]) -> List[OptionRow]:
 
 
 def grammar_depth_options(n: int, rows: Sequence[OptionRow]) -> List[OptionRow]:
-    """First n longest-reach-first. No command row before n=41."""
+    """First n following-first, then longest-reach-first. No command row before n=81."""
     # `sorted` is stable, so catalogue order is the last tiebreak without an index in the key
-    ordered = sorted(rows, key=lambda row: (row.slot is not None, -row.reach, row.group))
+    ordered = sorted(
+        rows, key=lambda row: (row.slot is not None, -row.follow, -row.reach, row.group)
+    )
     return list(ordered[:n])
 
 
@@ -367,6 +400,7 @@ def make_options(
             requires=NEEDS_NOTHING,
             effect=EFFECT_UNKNOWN,
             heading=NO_HEADING,
+            follow=0,
         )
         for i, action in enumerate(env_actions)
         if action not in CONCEDING_COMMANDS
@@ -421,8 +455,43 @@ def _neighbour_glyphs(glyphs: np.ndarray, x: int, y: int) -> np.ndarray:
     )
 
 
+def _walkable_neighbours(neighbours: np.ndarray) -> np.ndarray:
+    """Walkability per `COMPASS` entry. The diagonal flag is what refuses a door."""
+    return np.array(
+        [
+            _is_walkable(int(glyph), dx != 0 and dy != 0)
+            for glyph, (dx, dy) in zip(neighbours, COMPASS_OFFSETS)
+        ]
+    )
+
+
+def _reaim(walkable: np.ndarray, heading: int) -> int:
+    """Where `pi` steps: the heading when open, else the open neighbour nearest to
+    it in angle, else `NO_HEADING`. Read off the map, so a blocked candidate costs
+    no keystroke."""
+    if walkable[heading]:
+        return heading
+    aim = NO_HEADING
+    nearest = FULL_TURN_DEGREES
+    for candidate, bearing in enumerate(COMPASS_BEARING):
+        if candidate == heading or not walkable[candidate]:
+            continue
+        offset = abs(bearing - COMPASS_BEARING[heading])
+        offset = min(offset, FULL_TURN_DEGREES - offset)
+        # strict, so a tie keeps the lower `COMPASS` index
+        if offset < nearest:
+            nearest = offset
+            aim = candidate
+    return aim
+
+
 def _status(
-    row: OptionRow, prompted: bool, keys_sent: int, moves: int, blocked: bool
+    row: OptionRow,
+    prompted: bool,
+    keys_sent: int,
+    moves: int,
+    detoured: int,
+    blocked: bool,
 ) -> int:
     """pi and beta. `STATUS_DONE` is beta firing."""
     if keys_sent >= row.step_limit:
@@ -430,7 +499,9 @@ def _status(
     if keys_sent == 1 and row.argument is not None and (prompted or not row.prompts):
         return STATUS_ARGUMENT
     if row.reach:
-        return STATUS_DONE if blocked or moves >= row.reach else STATUS_KEY
+        if blocked or moves >= row.reach or detoured >= row.reach:
+            return STATUS_DONE
+        return STATUS_KEY
     if keys_sent == 0:
         return STATUS_KEY
     # no prompt: the argument would type at the map
@@ -456,7 +527,14 @@ class OptionWrapper(gym.Wrapper):
         )
         self.requires = np.array([row.requires for row in self.rows])
         self.headings = np.array([row.heading for row in self.rows])
-        self._drain_key = list(env.unwrapped.actions).index(DRAIN_KEY)
+        self.follows = np.array([bool(row.follow) for row in self.rows])
+        actions = list(env.unwrapped.actions)
+        self._drain_key = actions.index(DRAIN_KEY)
+        self._compass_keys = [actions.index(direction) for direction in COMPASS]
+        """A detour aims along a heading the row does not own, so `row.key` is not enough."""
+        self._frame: Tuple[Dict[str, np.ndarray], Dict[str, Any]] = ({}, {})
+        """Last frame the env returned. A decision that finds nowhere to step sends
+        no keystroke and still has to report against a state."""
         self._neighbours = np.full(len(COMPASS), nethack.NO_GLYPH)
         self._occupied = 0
         """Neighbours and slot count `interact_failed` diffs against."""
@@ -500,6 +578,7 @@ class OptionWrapper(gym.Wrapper):
             # copies, not views: NLE reuses the same two buffers
             self._ingame_blstats = obs["blstats"].copy()
             self._ingame_message = obs["message"].copy()
+        self._frame = (obs, info)
         return obs, reward, terminated, truncated, info
 
     def _drain(
@@ -525,8 +604,9 @@ class OptionWrapper(gym.Wrapper):
         """`I` as a bool mask.
 
         Movement: first cell walkable (not stone/walls/closed door; diagonal
-        refuses cmap 13/14, not doorway 12). Empty mask offers everything
-        (`grammar_depth` n<=40 is movement only).
+        refuses cmap 13/14, not doorway 12), or any cell walkable for a following
+        row, which can route around the heading. Empty mask offers everything
+        (`grammar_depth` n<=80 is movement only).
         """
         self._neighbours = _neighbour_glyphs(
             obs["glyphs"],
@@ -539,13 +619,10 @@ class OptionWrapper(gym.Wrapper):
         available |= (self.requires == NEEDS_SLOT) & np.isin(
             self.required_slots, obs["inv_letters"]
         )
-        walkable = np.array(
-            [
-                _is_walkable(int(glyph), dx != 0 and dy != 0)
-                for glyph, (dx, dy) in zip(self._neighbours, COMPASS_OFFSETS)
-            ]
+        walkable = _walkable_neighbours(self._neighbours)
+        available |= (self.requires == NEEDS_WALKABLE) & np.where(
+            self.follows, walkable.any(), walkable[self.headings]
         )
-        available |= (self.requires == NEEDS_WALKABLE) & walkable[self.headings]
         for code, predicate in MAP_PREDICATE.items():
             rows = self.requires == code
             if not rows.any():
@@ -597,6 +674,7 @@ class OptionWrapper(gym.Wrapper):
         self._episode_decisions = 0
         self._prompt_pending = False
         obs, info = self.env.reset(**kwargs)
+        self._frame = (obs, info)
         self._begin_decision()
         self._position = (
             int(obs["blstats"][nethack.NLE_BL_X]),
@@ -615,15 +693,26 @@ class OptionWrapper(gym.Wrapper):
         discount = 1.0
         keys_sent = 0
         moves = 0
+        detoured = 0
         blocked = False
         prompted = False
+        aim = row.heading
         # loop locals, not fields
         position = self._position
+        neighbours = self._neighbours
+        obs, info = self._frame
+        terminated = truncated = False
         while True:
-            status = _status(row, prompted, keys_sent, moves, blocked)
+            if row.follow:
+                aim = _reaim(_walkable_neighbours(neighbours), row.heading)
+                blocked = aim == NO_HEADING
+            status = _status(row, prompted, keys_sent, moves, detoured, blocked)
             if status == STATUS_DONE:
                 break
-            key = row.key if status == STATUS_KEY else row.argument
+            if status == STATUS_ARGUMENT:
+                key = row.argument
+            else:
+                key = self._compass_keys[aim] if row.follow else row.key
             obs, reward, terminated, truncated, info = self._primitive(key)
             total_reward += discount * reward
             discount *= self.gamma
@@ -632,11 +721,19 @@ class OptionWrapper(gym.Wrapper):
                 break
             prompted = bool(obs["misc"][MISC_IN_YN])
             if status == STATUS_KEY and row.reach:
-                if self._position == position:
-                    blocked = True
-                else:
+                advanced = self._position != position
+                if row.follow:
+                    if advanced and aim == row.heading:
+                        moves += 1
+                    else:
+                        detoured += 1
+                elif advanced:
                     moves += 1
+                else:
+                    blocked = True
             position = self._position
+            if row.follow:
+                neighbours = _neighbour_glyphs(obs["glyphs"], *self._position)
         drained = 0
         modal = not (terminated or truncated) and bool(obs["misc"].any())
         if modal and self._prompt_pending:
@@ -646,10 +743,24 @@ class OptionWrapper(gym.Wrapper):
         # after the drain so next `available` matches the state the next decision begins in
         self._prompt_pending = modal
         self._episode_decisions += 1
-        if keys_sent >= row.step_limit:
+        # a follow row's `step_limit` allows detours, so only directed moves finish its plan
+        completed = (moves >= row.reach) if row.follow else (keys_sent >= row.step_limit)
+        if completed:
             term_cause = TERM_SEQUENCE
         elif not (terminated or truncated):
-            term_cause = TERM_INTERRUPT
+            if blocked:
+                term_cause = TERM_NO_HEADING if keys_sent == 0 else TERM_BLOCKED
+            elif row.reach and detoured >= row.reach:
+                term_cause = TERM_DETOUR
+            elif keys_sent == 1 and row.argument is not None:
+                term_cause = TERM_NO_PROMPT
+            else:
+                raise RuntimeError(
+                    f"unenumerated beta: keys_sent={keys_sent} moves={moves} "
+                    f"detoured={detoured} blocked={blocked} follow={row.follow} "
+                    f"reach={row.reach} step_limit={row.step_limit} "
+                    f"argument={row.argument!r}"
+                )
         elif int(info["end_status"]) == STATUS_ABORTED:
             term_cause = TERM_ENV_ABORT
         else:

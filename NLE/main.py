@@ -15,6 +15,7 @@ import json
 import os
 import pathlib
 import re
+import socket
 import subprocess
 import sys
 import time
@@ -34,7 +35,7 @@ DEPTH_FAMILY_TAG = "exp3"
 """The only sweep allowed to name `grammar_depth`, so that `grammar` denotes one
 catalogue in every figure. Asserted by test_only_exp3_names_the_depth_prior."""
 
-FULL_CATALOGUE = 187
+FULL_CATALOGUE = 227
 """Rows `NetHackChallenge-v0`'s action set admits, so exp2's last n is the whole
 catalogue and its top point is not a family-dependent draw. `preflight` checks it
 against the realised size rather than trusting it."""
@@ -81,8 +82,17 @@ class CellArgs:
     gamma: float = 0.999
     num_envs: int = 16
     num_steps: int = 128
+    trace_flush_iterations: int = 64
+    """rollout iterations per parquet row group; matches `ppo.Args`"""
     tag: str = ""
 
+
+CHECKPOINT_KEEP_ALL_TAG = "exp1"
+"""The sweep whose cells keep every checkpoint, all three conditions of it, since
+the headline comparison is the one whose intermediate policies get inspected.
+Every other cell keeps three. Not a `CellArgs` field: it selects a cell rather
+than describing one, and adding it there would put it in the cell name and in
+every `meta.json`."""
 
 _DEFAULT_CELL = CellArgs()
 _NAMED_IF_NONDEFAULT = (
@@ -123,12 +133,21 @@ class Sweep:
 
 
 SWEEPS: Dict[str, Sweep] = {
+        # host gate: does anything solve staircase at all
+    "gate0": Sweep(
+        CellArgs(
+            env_id="DelayedStaircase-v0",
+            max_episode_steps=5_000,
+            budget=5_000_000,
+            tag="gate0",
+        ),
+    ),
     "exp1": Sweep(CellArgs(tag="exp1")),
     "exp2": Sweep(
         CellArgs(tag="exp2"),
         n_options=(8, 16, 32, 64, 128, FULL_CATALOGUE),
     ),
-    # n=64, not the full catalogue: at 187 every family returns the whole thing
+    # n=64, not the full catalogue: at 227 every family returns the whole thing
     # and the three coincide
     "exp3": Sweep(
         CellArgs(tag="exp3"),
@@ -314,6 +333,12 @@ def preflight(cells: Sequence[Cell]) -> None:
             action_sets[env_id] = list(env.unwrapped.actions)
             env.close()
         rows = _catalogue(action_sets[env_id])
+        if cell.args.n_options == FULL_CATALOGUE and len(rows) != FULL_CATALOGUE:
+            raise SystemExit(
+                f"ABORT: {cell.name} asks for FULL_CATALOGUE={FULL_CATALOGUE} rows "
+                f"but {env_id} admits {len(rows)}, so its top point is a prefix and "
+                "no longer the whole catalogue. Update FULL_CATALOGUE."
+            )
         chosen = select_options(
             rows, cell.args.n_options, cell.args.option_family, cell.args.option_seed
         )
@@ -363,6 +388,10 @@ def ppo_command(cell: Cell, seed: int) -> List[str]:
         "--tag",
         args.tag,
         "--clip-reward" if args.clip_reward else "--no-clip-reward",
+        "--checkpoint-keep",
+        "all" if args.tag == CHECKPOINT_KEEP_ALL_TAG else "endpoints",
+        "--trace-flush-iterations",
+        str(args.trace_flush_iterations),
     ]
 
 
@@ -526,7 +555,16 @@ def run_pool(
 
 
 def finish_cell(cell: Cell, elapsed: float) -> None:
-    """Write the `meta.json` that marks the cell complete."""
+    """Write the `meta.json` that marks the cell complete.
+
+    The cell-level aggregate, reached only when every seed succeeded. It is not
+    the provenance of record: `ppo.py` writes `provenance_seed{N}.json` per seed
+    unconditionally, which is the only thing a partially-failed cell leaves.
+    """
+    import nle
+
+    from ppo import LOG_SCHEMA_VERSION, git_sha
+
     meta = {
         "cell": cell.name,
         "group": cell.group,
@@ -536,6 +574,10 @@ def finish_cell(cell: Cell, elapsed: float) -> None:
         # of the group, not the cell: the pool interleaves seeds across cells, so
         # a cell has no wall-clock span of its own
         "group_elapsed_seconds": round(elapsed, 1),
+        "git_sha": git_sha(),
+        "nle_version": nle.__version__,
+        "host": socket.gethostname(),
+        "log_schema_version": LOG_SCHEMA_VERSION,
     }
     (cell.directory / "meta.json").write_text(json.dumps(meta, indent=2))
 

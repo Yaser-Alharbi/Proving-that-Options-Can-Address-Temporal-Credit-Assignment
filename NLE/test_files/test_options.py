@@ -1,84 +1,88 @@
-"""Tests pinning the option catalogue, so a draw cannot move unnoticed.
+"""Tests for `options.py`: the catalogue it enumerates and the controller it runs.
 
-`cd src && python -m pytest test_files/test_options.py -q`.
-
-The catalogue is the input every option cell is defined against. Both grammar
-families take a prefix of a total order and the random family reads its input
-positionally, so an edit to the enumeration order or to a sort key silently
-redraws the catalogue that some earlier run trained on. The digests below are the
-guard: they fail loudly, and re-recording one is a decision about whether every
-prior run of that family still counts, not a fix.
+Catalogue order is load-bearing: `random.sample` is positional and both grammar
+families take a prefix. The digests fail if that order moves. Executor tests use
+`StubNetHack`: `NetHackChallenge.seed` raises, so the pinned env cannot be seeded.
 """
 
-from typing import Dict, List, Sequence
+from typing import Any, Dict, FrozenSet, List, Sequence, Tuple
 
 import gymnasium as gym
+import numpy as np
 import pytest
 from nle import nethack
 
 from envs import OBSERVATION_KEYS
 from options import (
+    COMPASS,
+    COMPASS_OFFSETS,
     CONCEDING_COMMANDS,
     GROUP_ARG,
     GROUP_DIR,
     GROUP_MOVE,
     GROUP_SINGLE,
+    MISC_IN_YN,
     MOVE_REPEATS,
+    NEEDS_WALKABLE,
     OptionRow,
+    OptionWrapper,
     _catalogue,
     catalogue_digest,
     grammar_depth_options,
     grammar_options,
     make_options,
     random_options,
+    select_options,
 )
 
 ENV_ID = "NetHackChallenge-v0"
-"""The env exp1, exp2 and exp4 run on, and so the action set the digests pin.
-A task env exposes a smaller action set and would yield a shorter catalogue."""
+"""The env exp1/2/4 run on. A task env exposes a smaller action set."""
 
 SHORT_EPISODE = 10
-"""No test here steps the env; the horizon only has to be legal."""
+"""Legal horizon. No test here steps the env."""
 
-CATALOGUE_SIZE = 188
-GROUP_SIZES = {GROUP_MOVE: 40, GROUP_SINGLE: 16, GROUP_ARG: 100, GROUP_DIR: 32}
-CATALOGUE_DIGEST = "3902aa692e84b2e70fa1fbf57578e02051f2cc01aa97ff75d97609beb33806fb"
+CATALOGUE_SIZE = 187
+GROUP_SIZES = {GROUP_MOVE: 40, GROUP_SINGLE: 15, GROUP_ARG: 100, GROUP_DIR: 32}
+CATALOGUE_DIGEST = "8fe16ff640adaf9f27f828c3fe49da85bdbd55b79600a689d2dcb133244c26a9"
+
+GAMMA = 0.999
+INVENTORY_LENGTH = 55
+MESSAGE_LENGTH = 256
+MISC_LENGTH = 3
+
+START_X = 10
+START_Y = 8
+"""Stub hero cell. Away from the edges so all eight neighbours are on the map."""
+
+FLOOR_GLYPH = nethack.GLYPH_CMAP_OFF + 19
+WALL_GLYPH = nethack.GLYPH_CMAP_OFF + 1
+DOORWAY_GLYPH = nethack.GLYPH_CMAP_OFF + 12
+CLOSED_DOOR_GLYPH = nethack.GLYPH_CMAP_OFF + 15
+OPEN_DOOR_GLYPH = nethack.GLYPH_CMAP_OFF + 13
+"""cmap 19 lit room, 1 wall, 12 doorway, 15 closed door, 13 open. Named here: `options` does not export every cell."""
 
 DRAW_SIZE = 64
-"""The n exp1, exp3 and exp4 all use, so it is the draw worth pinning."""
+"""The n exp1, exp3 and exp4 use."""
 
 ENV_ACTION_SET = 121
 ACTION_TABLE = ENV_ACTION_SET - len(CONCEDING_COMMANDS)
-"""The env keeps its own action set; the table drops the conceding commands from
-every condition, so the two differ by exactly those rows."""
+"""The env keeps its action set; the table drops the conceding commands from every condition."""
 
 KNOWN_TURN_ONE_ESCAPES = ("up",)
-"""Free terminations kept in the table, as a decision rather than an oversight.
+"""Free termination in the primitive table, not the option catalogue.
 
-`up` on the first move climbs out of the dungeon for reward 0, because every game
-starts on the up-staircase of level 1. It is kept for two reasons: `TASK_ACTIONS`
-contains `MiscDirection.UP`, so removing it would not be what NLE does for a goal
-env; and the key that answers its prompt is `CompassDirection.NW`, whose value
-121 is ASCII `y`, so the confirmation cannot be removed without removing
-northwest movement.
-
-It is a confound, and it is not symmetric: the catalogue's `up` row is
-`(UP, ESC)` and the ESC cancels the prompt, so `option` cannot take this route
-while `action` and `both` can. It is reported rather than patched. The route is
-measurable after the fact without extra instrumentation, because
-`test_no_new_action_ends_the_episode_within_two_steps` establishes that nothing
-else terminates in two steps from a fresh game: an `episodic_length` of 2 in
-`episodes.csv` is this escape.
+`up` then northwest leaves level 1 for reward 0. `TASK_ACTIONS` contains `UP`;
+the confirm is northwest (`y`). Reachable under `action`/`both` only.
 """
 
-GRAMMAR_DIGEST = "8f4fd14eb0fefcb8982f193963ded5587ec3c911bc3e581ab7440575e7d823a2"
-GRAMMAR_DEPTH_DIGEST = "124ee31abd3f0d6c160230dd5219d6152aded894ac6e6664667128528fe93e98"
+GRAMMAR_DIGEST = "a7d03ca3459da7be266e123fbbc83e162ddebd2ed74a13a4a7de0eae63f6b11a"
+GRAMMAR_DEPTH_DIGEST = "48625a7b8afb9f197bff26c6d695a134a272f9c895cd30fb59f7da1088a28151"
 RANDOM_DIGESTS: Dict[int, str] = {
-    0: "9b422918e2050b6857870504d5ed1958e737129148b2a0e687d7ab73e2a7e87f",
-    1: "2a5e7fb6d1d2a7c388159c9b5c04b2574b91aecae0babad4f97238c7f03ca4eb",
-    2: "c09ce916a73dab3d594bf17c496468a0d94ce286b4d5674aac609875a326fc8b",
-    3: "50d6c3488fabe9bb40deb8ace025b68e5a2bfa2ca555e35d5d2e99c57bfdbc50",
-    4: "ba1f8841334f992adc69d27d992343f14459c21c4de18c4aaf4edbc0e5f291cd",
+    0: "a96e4638b5778939af2f72add147048475513b3877b256ed3d70e87dafaa77d4",
+    1: "6127d66260c50276aa2dc39e817bfb71eb9d7b4b9781eb05d77ad83a8513a763",
+    2: "4116ef05e1e9bdcc8ce38b868bc1db83f3df65fe35b3aaf5e6835bc891c8d9ec",
+    3: "c9fa83d3228a5b9883ec4c52dab6948cd3772b857eb9af02d067c058752a0ee2",
+    4: "b04c996cad5f6ceaf3096fc0280b7c40b87f869f3f39cf4cded7ff23fa58bd51",
 }
 """The five option seeds exp3 draws."""
 
@@ -87,29 +91,32 @@ GRAMMAR_PREFIX_AT_EIGHT = [
     "down",
     "open_N",
     "move_S_x16",
-    "up",
+    "wait",
     "open_S",
     "move_E_x16",
-    "wait",
+    "pickup",
 ]
-"""Spelled out rather than digested: this is the prefix the breadth-first prior
-was chosen for, and it is the readable evidence that a small n is not a
-movement-only catalogue."""
+"""Spelled out rather than digested: the breadth-first prefix at n=8 is not movement-only."""
 
 FIRST_INTERACTION_DEPTH = 40
-"""Rows of `grammar_depth` before the first non-movement row. Every movement row
-precedes every command row, so n at or below this is a capability floor."""
+"""`grammar_depth` rows before the first command. n at or below this is movement only."""
 
 
 @pytest.fixture(scope="module")
-def rows() -> List[OptionRow]:
-    """The full catalogue for `ENV_ID`'s action set."""
+def actions() -> Tuple[Any, ...]:
+    """`ENV_ID`'s action set, which is the one every digest is pinned against."""
     env = gym.make(
         ENV_ID, observation_keys=OBSERVATION_KEYS, max_episode_steps=SHORT_EPISODE
     )
-    catalogue = _catalogue(env.unwrapped.actions)
+    action_set = tuple(env.unwrapped.actions)
     env.close()
-    return catalogue
+    return action_set
+
+
+@pytest.fixture(scope="module")
+def rows(actions: Tuple[Any, ...]) -> List[OptionRow]:
+    """The full catalogue for `ENV_ID`'s action set."""
+    return _catalogue(actions)
 
 
 def digest_by_name(chosen: Sequence[OptionRow]) -> str:
@@ -117,13 +124,88 @@ def digest_by_name(chosen: Sequence[OptionRow]) -> str:
     return catalogue_digest(sorted(chosen, key=lambda row: row.name))
 
 
-def test_catalogue_enumeration_is_pinned(rows: List[OptionRow]) -> None:
-    """The canonical order is exactly what the digest records.
+class StubNetHack(gym.Env):
+    """Enough of NLE to drive the executor: a position, `misc`, and one map cell.
 
-    Re-recording `CATALOGUE_DIGEST` redraws the random family and moves both
-    grammar prefixes, so every prior option run is invalidated by it. Change the
-    enumeration only if you are willing to discard those runs.
+    `prompt_keys` raise a modal prompt held for `prompt_length` further keystrokes.
     """
+
+    def __init__(
+        self,
+        actions: Tuple[Any, ...],
+        *,
+        advance: bool = False,
+        prompt_keys: FrozenSet[int] = frozenset(),
+        prompt_length: int = 0,
+        background_glyph: int = FLOOR_GLYPH,
+        neighbour_glyph: int = FLOOR_GLYPH,
+        neighbour_heading: int = 0,
+        opens_door: bool = False,
+    ) -> None:
+        self.actions = list(actions)
+        self.advance = advance
+        self.prompt_keys = prompt_keys
+        self.prompt_length = prompt_length
+        self.background_glyph = background_glyph
+        self.neighbour_glyph = neighbour_glyph
+        self.neighbour_heading = neighbour_heading
+        self.opens_door = opens_door
+        self.inv_letters = np.zeros(INVENTORY_LENGTH, dtype=np.uint8)
+        self.keys: List[int] = []
+        self.action_space = gym.spaces.Discrete(len(self.actions))
+        self._modal = 0
+        self._x = START_X
+        self._y = START_Y
+        self._time = 1
+
+    def _observation(self) -> Dict[str, np.ndarray]:
+        """The observation keys the wrapper reads."""
+        glyphs = np.full(nethack.DUNGEON_SHAPE, self.background_glyph, dtype=np.int16)
+        dx, dy = COMPASS_OFFSETS[self.neighbour_heading]
+        glyphs[self._y + dy, self._x + dx] = self.neighbour_glyph
+        blstats = np.zeros(nethack.NLE_BLSTATS_SIZE, dtype=np.int64)
+        blstats[nethack.NLE_BL_X] = self._x
+        blstats[nethack.NLE_BL_Y] = self._y
+        blstats[nethack.NLE_BL_TIME] = self._time
+        misc = np.zeros(MISC_LENGTH, dtype=np.int32)
+        misc[MISC_IN_YN] = int(self._modal > 0)
+        return {
+            "glyphs": glyphs,
+            "blstats": blstats,
+            "inv_letters": self.inv_letters,
+            "misc": misc,
+            "message": np.zeros(MESSAGE_LENGTH, dtype=np.uint8),
+        }
+
+    def reset(self, **kwargs: Any) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
+        """Fresh position and no prompt. `neighbour_glyph` and `inv_letters` are left alone."""
+        self._modal = 0
+        self._x = START_X
+        self._y = START_Y
+        self._time = 1
+        self.keys = []
+        return self._observation(), {"end_status": 0}
+
+    def step(
+        self, action: int
+    ) -> Tuple[Dict[str, np.ndarray], float, bool, bool, Dict[str, Any]]:
+        """One keystroke. Never terminates: episode ends are not under test here."""
+        self.keys.append(action)
+        answering = self._modal > 0 and action not in self.prompt_keys
+        if action in self.prompt_keys:
+            self._modal = self.prompt_length
+        else:
+            self._modal = max(self._modal - 1, 0)
+        if self.opens_door and answering:
+            self.neighbour_glyph = OPEN_DOOR_GLYPH
+        if self.advance:
+            self._x += 1
+        self._time += 1
+        return self._observation(), 0.0, False, False, {"end_status": 0}
+
+
+def test_catalogue_enumeration_is_pinned(rows: List[OptionRow]) -> None:
+    """The canonical order is exactly what the digest records. Re-recording it redraws every family."""
     assert len(rows) == CATALOGUE_SIZE
     counts = {group: 0 for group in GROUP_SIZES}
     for row in rows:
@@ -136,22 +218,14 @@ def test_catalogue_enumeration_is_pinned(rows: List[OptionRow]) -> None:
 
 
 def test_movement_rows_carry_the_reach_ladder(rows: List[OptionRow]) -> None:
-    """`reach` is the repeat count on a movement row and zero elsewhere.
-
-    Both sort keys read `reach`, so a row that reports the wrong one is placed
-    wrongly in every family without changing the catalogue's size.
-    """
+    """`reach` is the repeat count on a movement row and zero elsewhere. Both sort keys read it."""
     reaches = {row.reach for row in rows if row.group == GROUP_MOVE}
     assert reaches == set(MOVE_REPEATS)
     assert all(row.reach == 0 for row in rows if row.group != GROUP_MOVE)
 
 
 def test_random_draw_is_pinned(rows: List[OptionRow]) -> None:
-    """Each option seed draws the set it has always drawn.
-
-    `random.sample` reads its input positionally, so this fails if the
-    name-sorted order changes for any reason, including a renamed row.
-    """
+    """Each option seed draws the set it has always drawn. `random.sample` is positional."""
     for option_seed, expected in RANDOM_DIGESTS.items():
         chosen = random_options(DRAW_SIZE, rows, option_seed)
         assert len(chosen) == DRAW_SIZE
@@ -162,11 +236,7 @@ def test_random_draw_is_pinned(rows: List[OptionRow]) -> None:
 
 
 def test_grammar_draws_are_pinned(rows: List[OptionRow]) -> None:
-    """Both grammar catalogues at n=64 are the ones exp1, exp2 and exp4 ran.
-
-    Pinned for the same reason as the random draw: a sort-key edit moves a
-    prefix without changing the catalogue it is taken from.
-    """
+    """Both grammar catalogues at n=64 are the ones exp1, exp2 and exp4 ran."""
     assert digest_by_name(grammar_options(DRAW_SIZE, rows)) == GRAMMAR_DIGEST
     assert (
         digest_by_name(grammar_depth_options(DRAW_SIZE, rows)) == GRAMMAR_DEPTH_DIGEST
@@ -176,23 +246,14 @@ def test_grammar_draws_are_pinned(rows: List[OptionRow]) -> None:
 def test_the_breadth_prior_reaches_three_groups_at_eight_rows(
     rows: List[OptionRow],
 ) -> None:
-    """`grammar` at n=8 can descend and open a door, not only walk.
-
-    This is why `grammar` is the breadth-first prior: it makes exp2's small n a
-    statement about catalogue size rather than about capability.
-    """
+    """`grammar` at n=8 can descend and open a door, not only walk."""
     assert [row.name for row in grammar_options(8, rows)] == GRAMMAR_PREFIX_AT_EIGHT
 
 
 def test_the_depth_prior_holds_no_interaction_below_its_movement_block(
     rows: List[OptionRow],
 ) -> None:
-    """`grammar_depth` places every movement row before every command row.
-
-    Asserts the floor itself, not a symptom of it: exp3 compares the two priors
-    at n=64, above the floor, and this records where the floor is so the
-    write-up's claim about small n under a depth-first prior is checkable.
-    """
+    """`grammar_depth` places every movement row before every command row."""
     ordered = grammar_depth_options(len(rows), rows)
     first_command = next(
         index for index, row in enumerate(ordered) if row.group != GROUP_MOVE
@@ -204,12 +265,7 @@ def test_the_depth_prior_holds_no_interaction_below_its_movement_block(
 def test_every_family_returns_the_whole_catalogue_at_full_size(
     rows: List[OptionRow],
 ) -> None:
-    """At n equal to the catalogue size the families coincide.
-
-    exp2's last n is the full catalogue, so its top point must not be a
-    family-dependent draw; this is the same property that makes exp3 run at
-    n=64 rather than at 188.
-    """
+    """At n equal to the catalogue size the families coincide."""
     everything = {row.name for row in rows}
     for chosen in (
         grammar_options(len(rows), rows),
@@ -222,11 +278,7 @@ def test_every_family_returns_the_whole_catalogue_at_full_size(
 def test_asking_for_more_options_than_the_catalogue_holds_is_an_error(
     rows: List[OptionRow],
 ) -> None:
-    """A reachable mistake, since exp2's n axis is written by hand.
-
-    Raised in `make_options` rather than in the families, so all three report it
-    the same way.
-    """
+    """A reachable mistake: exp2's n axis is written by hand."""
     env = gym.make(
         ENV_ID, observation_keys=OBSERVATION_KEYS, max_episode_steps=SHORT_EPISODE
     )
@@ -236,15 +288,7 @@ def test_asking_for_more_options_than_the_catalogue_holds_is_an_error(
 
 
 def test_the_conceding_commands_are_absent_from_every_condition() -> None:
-    """No condition can select `QUIT` or `SAVE`.
-
-    `QUIT` then `y` ends an episode in two primitive steps for reward 0, which
-    beats any trajectory whose future score does not cover the time penalty.
-    They were reachable in `action` and `both` but never in `option`, because no
-    catalogue row emits either key, so leaving them in gave two of the three
-    conditions an exploit the third could not use — a confound pointing the same
-    way as the hypothesis.
-    """
+    """No condition can select `QUIT` or `SAVE`. Two-step reward-0 exit."""
     env = gym.make(
         ENV_ID, observation_keys=OBSERVATION_KEYS, max_episode_steps=SHORT_EPISODE
     )
@@ -264,17 +308,7 @@ def test_the_conceding_commands_are_absent_from_every_condition() -> None:
 
 
 def test_no_new_action_ends_the_episode_within_two_steps() -> None:
-    """Only the recorded escapes concede, so a new route cannot appear unnoticed.
-
-    Asserts the property rather than the absence of two named commands: this is
-    how `up` was found, after `QUIT` and `SAVE` had been removed. Each row is
-    played from a fresh game and followed by northwest movement, which is the
-    keystroke that answers a yes/no prompt.
-
-    Subset rather than equality, because the character is random and a two-step
-    death by misfortune would otherwise fail the run;
-    `test_the_recorded_escape_still_exists` covers the other direction.
-    """
+    """Only the recorded escapes concede. Subset, not equality: a two-step death by misfortune would fail equality."""
     env = gym.make(
         ENV_ID, observation_keys=OBSERVATION_KEYS, max_episode_steps=SHORT_EPISODE
     )
@@ -301,12 +335,7 @@ def test_no_new_action_ends_the_episode_within_two_steps() -> None:
 
 
 def test_the_recorded_escape_still_exists() -> None:
-    """`up` then northwest still concedes, so the recorded exception is live.
-
-    Without this, an NLE change that closed the route would leave
-    `KNOWN_TURN_ONE_ESCAPES` silently permitting something impossible, and the
-    write-up would keep reporting a confound that no longer applies.
-    """
+    """`up` then northwest still concedes, so the recorded exception is live."""
     env = gym.make(
         ENV_ID, observation_keys=OBSERVATION_KEYS, max_episode_steps=SHORT_EPISODE
     )
@@ -327,13 +356,7 @@ def test_the_recorded_escape_still_exists() -> None:
 def test_both_is_the_primitive_table_followed_by_the_options(
     rows: List[OptionRow],
 ) -> None:
-    """An action index means the same thing under `action` and under `both`.
-
-    Cross-condition comparability rests on this: the two conditions share a
-    prefix of the action table, so a logged action index is one quantity. The
-    prefix is the table's rows, not the env's action indices, which differ from
-    them wherever a conceding command was dropped.
-    """
+    """An action index means the same thing under `action` and under `both`. Prefix is table rows, not env indices."""
     env = gym.make(
         ENV_ID, observation_keys=OBSERVATION_KEYS, max_episode_steps=SHORT_EPISODE
     )
@@ -351,3 +374,255 @@ def test_both_is_the_primitive_table_followed_by_the_options(
     assert both_sequences[:count] == primitive_sequences
     assert both_names[:count] == primitive_names
     assert both_sequences[count:] == option_sequences
+
+
+def primitive_table(actions: Tuple[Any, ...]) -> Tuple[List[OptionRow], List[str]]:
+    """The `action` table and its row names."""
+    rows, names, _ = make_options(actions, "action", 0, "grammar", 0)
+    return rows, names
+
+
+def option_table(actions: Tuple[Any, ...]) -> Tuple[List[OptionRow], List[str]]:
+    """The whole catalogue as an option table, so every row name is present."""
+    rows, names, _ = make_options(actions, "option", CATALOGUE_SIZE, "grammar", 0)
+    return rows, names
+
+
+def key_index(actions: Tuple[Any, ...], command: Any) -> int:
+    """The env action index of `command`."""
+    return list(actions).index(command)
+
+
+def test_a_modal_state_surviving_a_decision_is_drained_and_charged(
+    actions: Tuple[Any, ...],
+) -> None:
+    """The drain's keystrokes are counted in `primitive_steps`. Four prompt keys, so three drain steps."""
+    rows, names = primitive_table(actions)
+    stub = StubNetHack(
+        actions,
+        prompt_keys=frozenset({key_index(actions, nethack.Command.EAT)}),
+        prompt_length=4,
+    )
+    env = OptionWrapper(stub, rows, gamma=GAMMA)
+    env.reset()
+
+    _, _, _, _, opened = env.step(names.index("eat"))
+    assert opened["drain_steps"] == 0, "the decision that opens a prompt keeps it"
+    assert opened["primitive_steps"] == 1
+
+    _, _, _, _, drained = env.step(names.index("wait"))
+    assert drained["drain_steps"] == 3, "the drain runs until misc is clear"
+    assert drained["primitive_steps"] == 1 + drained["drain_steps"], (
+        "the row's own keystroke plus the drain's, charged to this decision"
+    )
+
+
+def test_the_grace_decision_is_the_only_modal_one(actions: Tuple[Any, ...]) -> None:
+    """A prompt survives exactly one decision, and only then is it drained. Pins "survived", not "is set"."""
+    rows, names = primitive_table(actions)
+    stub = StubNetHack(
+        actions,
+        prompt_keys=frozenset({key_index(actions, nethack.Command.EAT)}),
+        prompt_length=2,
+    )
+    env = OptionWrapper(stub, rows, gamma=GAMMA)
+    obs, _ = env.reset()
+
+    modal_at_choice: List[bool] = []
+    drained: List[int] = []
+    for _ in range(6):
+        modal_at_choice.append(bool(obs["misc"].any()))
+        obs, _, _, _, info = env.step(names.index("eat"))
+        drained.append(int(info["drain_steps"]))
+
+    assert any(modal_at_choice), "the stub must go modal or this is vacuous"
+    assert not any(
+        earlier and later
+        for earlier, later in zip(modal_at_choice, modal_at_choice[1:])
+    ), "no two consecutive decisions may be chosen under a modal observation"
+    assert [count > 0 for count in drained] == modal_at_choice, (
+        "a decision drains exactly when it began modal"
+    )
+
+
+def test_a_movement_row_stops_when_the_position_stops_changing(
+    actions: Tuple[Any, ...],
+) -> None:
+    """Beta reads the position, so a blocked 16-move costs one primitive step."""
+    rows, names = option_table(actions)
+    stub = StubNetHack(actions, advance=False)
+    env = OptionWrapper(stub, rows, gamma=GAMMA)
+    env.reset()
+
+    _, _, _, _, info = env.step(names.index(f"move_N_x{max(MOVE_REPEATS)}"))
+    assert info["primitive_steps"] == 1, "one keystroke establishes it is blocked"
+    assert len(stub.keys) == 1
+
+
+def test_a_movement_row_that_keeps_moving_spends_its_reach(
+    actions: Tuple[Any, ...],
+) -> None:
+    """The other side of the same beta: nothing stops an unobstructed row early."""
+    rows, names = option_table(actions)
+    reach = max(MOVE_REPEATS)
+    stub = StubNetHack(actions, advance=True)
+    env = OptionWrapper(stub, rows, gamma=GAMMA)
+    env.reset()
+
+    _, _, _, _, info = env.step(names.index(f"move_N_x{reach}"))
+    assert info["primitive_steps"] == reach
+    assert len(stub.keys) == reach
+
+
+def test_initiation_reads_the_map_and_the_inventory(actions: Tuple[Any, ...]) -> None:
+    """`I` offers a directional row only when the cell along its heading fits."""
+    rows, names = option_table(actions)
+    stub = StubNetHack(actions, neighbour_glyph=FLOOR_GLYPH)
+    env = OptionWrapper(stub, rows, gamma=GAMMA)
+
+    _, floor = env.reset()
+    assert not floor["available"][names.index("open_N")], "no door to open"
+    assert not floor["available"][names.index("close_N")], "no door to close"
+    assert not floor["available"][names.index("fight_N")], "no monster to fight"
+    assert not floor["available"][names.index("eat_a")], "slot a is empty"
+    assert floor["available"][names.index("move_N_x16")], "floor north is walkable"
+    assert floor["available"][names.index("pickup")], (
+        "pickup stays unconditional: the hero's own glyph hides what it would test"
+    )
+
+    stub.neighbour_glyph = CLOSED_DOOR_GLYPH
+    stub.inv_letters[0] = ord("a")
+    _, closed = env.reset()
+    assert closed["available"][names.index("open_N")]
+    assert not closed["available"][names.index("close_N")]
+    assert closed["available"][names.index("eat_a")]
+    assert not closed["available"][names.index("eat_b")], "slot b is still empty"
+
+    stub.neighbour_glyph = OPEN_DOOR_GLYPH
+    _, opened = env.reset()
+    assert opened["available"][names.index("close_N")]
+    assert not opened["available"][names.index("open_N")]
+
+
+def test_a_movement_row_needs_a_walkable_first_cell(actions: Tuple[Any, ...]) -> None:
+    """`I` refuses a movement row that would spend its first step on a wall. Beta cannot refuse that without paying the step."""
+    rows, names = option_table(actions)
+    stub = StubNetHack(actions, neighbour_glyph=WALL_GLYPH)
+    env = OptionWrapper(stub, rows, gamma=GAMMA)
+
+    _, walled = env.reset()
+    for reach in MOVE_REPEATS:
+        assert not walled["available"][names.index(f"move_N_x{reach}")], (
+            f"a wall north blocks move_N_x{reach} whatever its reach"
+        )
+    assert walled["available"][names.index("move_S_x16")], "only north is walled"
+    assert walled["available"][names.index("wait")], "SINGLE rows stay unconditional"
+    assert 0.0 < walled["available_frac"] < 1.0
+
+    stub.neighbour_glyph = FLOOR_GLYPH
+    _, floor = env.reset()
+    assert floor["available"][names.index("move_N_x16")]
+    assert floor["available_frac"] > walled["available_frac"], (
+        "gating movement on the first cell has to move available_frac"
+    )
+
+
+def test_a_diagonal_movement_row_is_refused_into_a_door(
+    actions: Tuple[Any, ...],
+) -> None:
+    """NetHack takes no diagonal step into an open door (cmap 13/14). A doorway (cmap 12) is not refused."""
+    rows, names = option_table(actions)
+    northeast = COMPASS.index(nethack.CompassDirection.NE)
+    stub = StubNetHack(
+        actions, neighbour_glyph=OPEN_DOOR_GLYPH, neighbour_heading=northeast
+    )
+    env = OptionWrapper(stub, rows, gamma=GAMMA)
+
+    _, door = env.reset()
+    assert not door["available"][names.index("move_NE_x16")], "no diagonal into a door"
+    assert door["available"][names.index("move_N_x16")], "orthogonal is unaffected"
+
+    stub.neighbour_glyph = DOORWAY_GLYPH
+    _, doorway = env.reset()
+    assert doorway["available"][names.index("move_NE_x16")], (
+        "an empty doorway takes a diagonal move"
+    )
+
+
+def test_interact_failed_reads_the_target_glyph(actions: Tuple[Any, ...]) -> None:
+    """A door row fails when its cell still looks the way it did. Glyph, not message: both lock and open print something."""
+    rows, names = option_table(actions)
+    for opens_door, expected_failure in ((True, False), (False, True)):
+        stub = StubNetHack(
+            actions,
+            neighbour_glyph=CLOSED_DOOR_GLYPH,
+            prompt_keys=frozenset({key_index(actions, nethack.Command.OPEN)}),
+            prompt_length=1,
+            opens_door=opens_door,
+        )
+        env = OptionWrapper(stub, rows, gamma=GAMMA)
+        env.reset()
+
+        _, _, _, _, info = env.step(names.index("open_N"))
+        assert info["primitive_steps"] == 2, "the command and its argument"
+        assert info["interact_failed"] is expected_failure
+
+
+def test_a_prompt_that_never_opens_suppresses_the_argument(
+    actions: Tuple[Any, ...],
+) -> None:
+    """Pi emits the argument only once `misc` says the game is waiting for one."""
+    rows, names = option_table(actions)
+    stub = StubNetHack(actions, neighbour_glyph=CLOSED_DOOR_GLYPH)
+    env = OptionWrapper(stub, rows, gamma=GAMMA)
+    env.reset()
+
+    _, _, _, _, info = env.step(names.index("open_N"))
+    assert info["primitive_steps"] == 1, "beta fires rather than emitting the argument"
+    assert stub.keys == [key_index(actions, nethack.Command.OPEN)]
+
+
+def test_every_row_carries_a_step_limit_and_the_movement_ladder(
+    rows: List[OptionRow],
+) -> None:
+    """`step_limit` is beta's bound, and on a movement row it is the reach ladder."""
+    assert all(row.step_limit >= 1 for row in rows), "every row emits a keystroke"
+    movement = [row for row in rows if row.group == GROUP_MOVE]
+    assert {row.step_limit for row in movement} == set(MOVE_REPEATS)
+    assert all(row.step_limit == row.reach for row in movement)
+    assert all(row.heading in range(len(COMPASS)) for row in movement)
+
+
+def test_a_mask_with_nothing_in_it_offers_everything(
+    actions: Tuple[Any, ...], rows: List[OptionRow]
+) -> None:
+    """`I` falls back to the whole table rather than handing back all-False. `grammar_depth` n=8 is movement only."""
+    walled_in = StubNetHack(
+        actions, background_glyph=WALL_GLYPH, neighbour_glyph=WALL_GLYPH
+    )
+    draw = select_options(rows, 8, "grammar_depth", 0)
+    assert all(row.requires == NEEDS_WALKABLE for row in draw), (
+        "the draw must hold no unconditional row or the fallback is untested"
+    )
+    env = OptionWrapper(walled_in, draw, gamma=GAMMA)
+
+    _, info = env.reset()
+    assert info["available"].all()
+    assert info["available_frac"] == 1.0
+    assert info["initiation_empty"], "the fallback has to be visible in the contract"
+
+    walled_in.background_glyph = FLOOR_GLYPH
+    walled_in.neighbour_glyph = FLOOR_GLYPH
+    _, open_floor = env.reset()
+    assert not open_floor["initiation_empty"], "the flag must not latch"
+
+
+def test_the_option_table_sizes_the_action_space(actions: Tuple[Any, ...]) -> None:
+    """`action_space` counts table rows, which is what the policy's head sizes to."""
+    rows, names = option_table(actions)
+    stub = StubNetHack(actions)
+    env = OptionWrapper(stub, rows, gamma=GAMMA)
+    _, info = env.reset()
+
+    assert env.action_space.n == CATALOGUE_SIZE == len(names)
+    assert info["available"].shape == (CATALOGUE_SIZE,)

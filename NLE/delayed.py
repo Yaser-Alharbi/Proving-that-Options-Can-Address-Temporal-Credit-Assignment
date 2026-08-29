@@ -35,6 +35,7 @@ class HeldGoal:
     def __init__(self, *args: Any, reward_delay: int = 0, **kwargs: Any) -> None:
         self._reward_delay = reward_delay
         self._held: Optional[int] = None
+        self._paid = False
         # the goal tasks default to TASK_ACTIONS, 23 keys, which enumerates to 49
         # catalogue rows and no directional row at all. `NetHackChallenge` uses
         # nethack.ACTIONS, so matching it is what makes `grammar` at n=64 the
@@ -48,6 +49,7 @@ class HeldGoal:
         # before super(), because NLE.reset ends by calling _get_end_status, so a
         # game that starts the agent on a staircase would latch during it
         self._held = None
+        self._paid = False
         return super().reset(*args, **kwargs)  # type: ignore[misc]
 
     def _is_episode_end(self, observation: Any) -> int:
@@ -80,7 +82,22 @@ class HeldGoal:
         # reaching zero: the horizon and a death inside the hold are terminal
         # too, and both have to compress the payout rather than delete it, or
         # `episodic_return` stops being delay-invariant
-        return time_penalty + (1.0 if self._held is not None else 0.0)
+        self._paid = self._held is not None
+        return time_penalty + (1.0 if self._paid else 0.0)
+
+    def _get_information(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        """The base information, plus whether this step flushed the banked reward.
+
+        Read off the latch `_reward_fn` set rather than recomputed here: NLE calls
+        `_reward_fn` first, and only it is given the `end_status` that decides
+        whether the payout happened. A flush at the horizon or on a death reports
+        ABORTED or DEATH, so `end_status` alone cannot answer this.
+        """
+        information: Dict[str, Any] = super()._get_information(  # type: ignore[misc]
+            *args, **kwargs
+        )
+        information["paid"] = self._paid
+        return information
 
 
 DELAYED_ENVS: Dict[str, Type[NLE]] = {

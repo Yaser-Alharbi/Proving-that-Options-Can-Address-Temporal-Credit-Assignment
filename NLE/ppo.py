@@ -73,6 +73,8 @@ EPISODE_COLUMNS = IDENTITY_COLUMNS + (
     # this column that meaning and leaving `terminated` the gymnasium flag keeps
     # one name per question on both tracks.
     "solved",
+    # goal reward paid this episode
+    "paid",
     "mean_option_duration",
 )
 
@@ -587,6 +589,17 @@ if __name__ == "__main__":
                     print(f"frames={frames}, episodic_return={episodic_return}")
                     writer.add_scalar("charts/episodic_return", episodic_return, frames)
                     writer.add_scalar("charts/episodic_length", episodic_length, frames)
+                    solved = int(
+                        int(infos["end_status"][env_index]) == TASK_SUCCESSFUL
+                    )
+                    # if no `paid`, use `solved`
+             
+                    paid_mask = infos.get("_paid")
+                    paid = (
+                        int(infos["paid"][env_index])
+                        if paid_mask is not None and paid_mask[env_index]
+                        else solved
+                    )
                     csv_writer.writerow(
                         {
                             **identity,
@@ -596,9 +609,8 @@ if __name__ == "__main__":
                             "episodic_return": episodic_return,
                             "episodic_length": episodic_length,
                             "terminated": int(terminations[env_index]),
-                            "solved": int(
-                                int(infos["end_status"][env_index]) == TASK_SUCCESSFUL
-                            ),
+                            "solved": solved,
+                            "paid": paid,
                             "mean_option_duration": episodic_length / max(episode_decisions, 1),
                         }
                     )

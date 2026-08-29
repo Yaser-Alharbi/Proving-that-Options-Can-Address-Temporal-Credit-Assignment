@@ -14,28 +14,14 @@ OBSERVATION_KEYS = ("glyphs", "blstats", "inv_letters", "misc", "message")
 REWARD_CLIP = 1.0
 
 TASK_SUCCESSFUL = int(NetHackStaircase.StepStatus.TASK_SUCCESSFUL)
-"""`info["end_status"]` value meaning the goal fired, which is what the `solved`
-column records. Read off the task class rather than written as a literal: base
-NLE's `StepStatus` has no such member, so the number only exists on the goal
-tasks, and the delayed envs inherit this enum."""
+"""`end_status` for goal fired (`solved`). Off the task class: base NLE has no such member."""
 
 STATUS_RUNNING = int(NLE.StepStatus.RUNNING)
-"""`end_status` on an episode the game itself did not end. `gymnasium.make`
-takes `max_episode_steps` for a `TimeLimit` of its own, so a truncated
-`NetHackChallenge` episode arrives with the game still in progress and NetHack
-has written no xlogfile record for it. The episode log reads the character off
-that record, so it must know the difference."""
+"""`end_status` when the game itself did not end. Gymnasium TimeLimit truncations write no xlogfile."""
 
 
 def make_nle(env_id: str, max_episode_steps: int, reward_delay: int = 0) -> gym.Env:
-    """The bare env for `env_id`, before any wrapper.
-
-    The delayed envs are constructed rather than made, because `gymnasium.make`
-    takes `max_episode_steps` for a `TimeLimit` of its own; see
-    `delayed.DELAYED_ENVS`. One function so that anything needing an env for an
-    `env_id` — the trainer, main.py's catalogue preflight — agrees on which
-    class and which horizon that is.
-    """
+    """Bare env for `env_id`. Delayed envs are constructed, not `gym.make` (that would add another TimeLimit)."""
     if env_id in DELAYED_ENVS:
         return DELAYED_ENVS[env_id](
             observation_keys=OBSERVATION_KEYS,
@@ -62,7 +48,7 @@ def make_env(
     option_seed: int,
     reward_delay: int,
 ) -> Callable[[], gym.Env]:
-    """Return a thunk building one NLE env that satisfies the trainer's contract."""
+    """Thunk for one NLE env that satisfies the trainer's contract."""
     assert reward_delay == 0 or env_id in DELAYED_ENVS, (
         f"{env_id} has no delay mechanism, so reward_delay={reward_delay} would "
         f"be silently ignored; the delayed envs are {sorted(DELAYED_ENVS)}"
@@ -70,16 +56,10 @@ def make_env(
 
     def thunk() -> gym.Env:
         env = make_nle(env_id, max_episode_steps, reward_delay)
-        # innermost, so `l` counts primitive steps and `r` sums raw undiscounted
-        # reward. Above the clip or the option wrapper it would instead report
-        # decisions and a discounted sum, which are different quantities in the
-        # option condition than in the action condition and so not comparable.
+        # innermost: `l` is primitive steps, `r` is raw undiscounted reward
         env = gym.wrappers.RecordEpisodeStatistics(env)
         if clip_reward:
-            # below OptionWrapper, so the clip applies per primitive step rather
-            # than to an option's discounted sum. Clipping the decision reward
-            # would be a different transformation for a 16-step option than for
-            # a primitive.
+            # below OptionWrapper so the clip is per primitive, not per decision
             env = gym.wrappers.ClipReward(env, -REWARD_CLIP, REWARD_CLIP)
         rows, _, _ = make_options(
             env.unwrapped.actions, condition, n_options, option_family, option_seed

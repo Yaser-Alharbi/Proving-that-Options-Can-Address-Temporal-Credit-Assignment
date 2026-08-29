@@ -1,12 +1,4 @@
-# based on https://docs.cleanrl.dev/rl-algorithms/ppo/#ppo_ataripy, edited in place.
-# Deviations from upstream, carried over from navix/ppo.py:
-#   - the budget is spent in primitive steps, not decisions, so the loop is a
-#     while on frames and the learning rate anneals against the same count
-#   - the policy over options is masked to the initiation sets containing s_t,
-#     and the mask that gated the action is stored and reapplied in the loss
-#   - gamma applies once per decision, or raised to the option's duration (SMDP)
-#   - the transition a NEXT_STEP autoreset inserts is excluded from the loss and
-#     from the diagnostics
+# CleanRL ppo_atari.py. Budget/LR in primitive steps; initiation mask stored for the loss; SMDP gamma; NEXT_STEP phantom excluded.
 import csv
 import json
 import os
@@ -34,21 +26,15 @@ from envs import STATUS_RUNNING, TASK_SUCCESSFUL, make_env
 from options import TERM_CAUSE_NAMES
 
 MASKED_LOGIT = -1e8
-"""Logit given to an unavailable action. Large and negative rather than -inf, so
-`log_softmax` stays finite and the entropy term is 0 * finite, not 0 * -inf."""
+"""Unavailable logit. Finite so entropy is 0*finite, not 0*-inf."""
 
 HIDDEN_DIM = 512
 
 CHECKPOINT_EVERY_FRAMES = 500_000
-"""Write a checkpoint this many primitive steps. Against frames, not wall-clock,
-so the interval is comparable across conditions. Resume is not offered: NLE
-env state is not serialised, so a resumed run is not the continuation of a
-killed one."""
+"""Checkpoint cadence in primitive steps. No resume: NLE env state is not serialised."""
 
 LOG_SCHEMA_VERSION = 2
-"""Bump on any change to `EPISODE_COLUMNS` or to the trace shard arrays. Written
-to `provenance_seed{N}.json`, so a reader can tell which columns a directory
-predates without inferring it from the header."""
+"""Bump on `EPISODE_COLUMNS` or the trace shard arrays."""
 
 BLSTATS_FIELDS = (
     ("score", nethack.NLE_BL_SCORE),
@@ -63,36 +49,23 @@ BLSTATS_FIELDS = (
     ("hunger", nethack.NLE_BL_HUNGER),
     ("time", nethack.NLE_BL_TIME),
 )
-"""Episode-record column name against its index into `blstats`."""
-
 BLSTATS_INDEX = dict(BLSTATS_FIELDS)
 
 BLSTATS_PEAK_FIELDS = ("score", "dlvl", "xp_level", "xp_points", "gold")
-"""Which of the above also get an episode maximum, as `max_{name}`. The fields
-that only rise, so that the terminal value is the whole story for the rest:
-`time` is monotone and already reported as `turns_survived`, while `hp`, `ac`
-and `hunger` fluctuate and their peaks describe nothing an episode did."""
+"""Episode maxima as `max_{name}`. Skip `time` (`turns_survived`) and fluctuating fields."""
 
 TRACE_BLSTATS_FIELDS = ("dlvl", "score", "hp", "time")
-"""Trace shard columns taken from the pre-step observation, so that they align
-with the value and logprob of the same row rather than with its outcome."""
+"""Trace columns from the pre-step observation (aligned with value/logprob)."""
 
 MAX_TRACKED_DLVL = 64
-"""Width of the per-episode depth-coverage mask, which `unique_dlvls` counts.
-NetHack's deepest level is in the fifties, so nothing reachable falls outside
-it; a depth that did would go uncounted rather than resize the mask."""
+"""Width of the per-episode depth mask. A deeper level is uncounted, not a resize."""
 
 XLOGFILE_FIELDS = ("role", "race", "gender", "align")
-"""What the episode record takes from NetHack's own log. `NetHackChallenge`
-passes `character="@"`, so these are drawn per episode and are not knowable
-from the run's arguments. The death reason is deliberately not taken from here;
-`terminal_message` comes from the observation, which exists either way."""
+"""From NetHack's log. `character="@"` so these vary per episode. Death reason is `terminal_message`."""
 
 IDENTITY_SENTINEL_STR = "-"
 IDENTITY_SENTINEL_INT = 0
-"""Navix identity columns with no NLE analogue: `executor`, because one Python
-loop is the only executor, and `max_forward`, because no reach bound parameterises
-the NLE catalogue. Kept so plot.py reads both tracks without joins."""
+"""Navix-only columns: one Python loop, no `max_forward` parameter. plot.py joins both tracks."""
 
 IDENTITY_COLUMNS = (
     "env_id",
@@ -116,39 +89,29 @@ EPISODE_COLUMNS = IDENTITY_COLUMNS + (
     "episodic_return",
     "episodic_length",
     "terminated",
-    # not the same question as `terminated`, which NLE also sets on death and on
-    # its own step-limit abort. Navix's `terminated` means goal-reached; giving
-    # this column that meaning and leaving `terminated` the gymnasium flag keeps
-    # one name per question on both tracks.
+    # goal-reached (Navix `terminated`); gymnasium `terminated` is the other question
     "solved",
-    # goal reward paid this episode
     "paid",
     "mean_option_duration",
-    # the game state at the last primitive with a turn on it, not at the
-    # terminal observation: NetHack zeroes blstats once the game is over
+    # last in-game frame, not the zeroed terminal obs
     *(name for name, _ in BLSTATS_FIELDS),
     *(f"max_{name}" for name in BLSTATS_PEAK_FIELDS),
     "end_status",
     "is_ascended",
     "terminal_message",
-    # reward structure. The sums are of what the wrapper was handed, so under
-    # `clip_reward` they are sums of clipped primitives; `episodic_return` is
-    # the unclipped one, from a `RecordEpisodeStatistics` below the clip.
+    # sums of what the wrapper was handed (clipped if `clip_reward`); `episodic_return` is unclipped
     "steps_to_first_reward",
     "n_nonzero_reward_steps",
     "sum_positive_clipped",
     "sum_negative_clipped",
     "clipped_return",
-    # both discount conventions every episode, whichever one trained: the
-    # comparison between them is the point, and neither is recoverable from
-    # the other after the fact
+    # both clocks, whichever trained
     "return_decision",
     "return_primitive",
     "decision_count",
     "primitive_count",
     "option_calls",
     "fallback_frac",
-    # one JSON object per episode, keyed by the option id it invoked
     "option_stats",
     "unique_dlvls",
     "turns_survived",
@@ -161,9 +124,7 @@ EPISODE_COLUMNS = IDENTITY_COLUMNS + (
 
 ENCODER_OBS_DTYPE = {
     "glyphs": torch.int16,
-    # int64 in the observation space, but the encoder's first op is `.float()`,
-    # and float32 halves the buffer. Exact only to 2**24, which NetHack score
-    # and gold cannot reach at these budgets.
+    # int64 in the space; encoder `.float()`s it. float32 exact to 2**24.
     "blstats": torch.float32,
 }
 """Network keys. Wrapper also needs `inv_letters`/map for `I` and `misc` for the drain."""
@@ -179,10 +140,7 @@ class Args:
     n_options: int = 64
     """how many rows the catalogue is subsampled to; ignored when condition is `action`"""
     option_family: Literal["grammar", "grammar_depth", "random"] = "grammar"
-    """`grammar` takes the catalogue breadth-first across its row classes,
-    `grammar_depth` longest-reach-first, `random` a uniform draw seeded by
-    `option_seed`. `grammar` is the same catalogue in every experiment that names
-    it; only exp3 runs `grammar_depth`."""
+    """`grammar` breadth-first, `grammar_depth` longest-reach-first, `random` by `option_seed`. Only exp3 runs `grammar_depth`."""
     option_seed: int = 0
     """seed for the random option family, kept separate from the training seeds"""
     reward_delay: int = 0
@@ -190,18 +148,13 @@ class Args:
     discount: Literal["decision", "primitive"] = "decision"
     """gamma once per decision, or raised to the option's duration (SMDP)"""
     max_episode_steps: int = 100_000
-    """primitive steps before truncation. Set explicitly: NetHackChallenge
-    defaults to 1e6, at which one episode can consume a whole run."""
+    """primitive steps before truncation. NetHackChallenge defaults to 1e6."""
     clip_reward: bool = True
     """clip reward to [-1, 1] per primitive step, before any option sums it"""
     log_trace: bool = True
-    """write one compressed shard per update to `decisions_seed{N}/`. One row per
-    env per `envs.step`, so the grain is decisions, not primitive steps: value
-    and logprob only exist where the policy acted."""
+    """one shard per update, one row per `envs.step` (decisions, not primitives)"""
     checkpoint_keep: Literal["all", "endpoints"] = "endpoints"
-    """`endpoints` writes the first checkpoint, the first at half the budget and
-    the last, which is three files a seed. `all` writes every cadence hit and is
-    for one representative cell: a full sweep of them does not fit the quota."""
+    """`endpoints` is first, midpoint, last. `all` is every cadence hit."""
     directory: str = ""
     """cell directory written by main.py. Empty: a standalone run under results/"""
     tag: str = ""
@@ -220,7 +173,6 @@ class Args:
     wandb_entity: Optional[str] = None
     """the entity (team) of wandb's project"""
 
-    # Algorithm specific arguments
     learning_rate: float = 1e-4
     """the learning rate of the optimizer"""
     num_envs: int = 16
@@ -252,7 +204,6 @@ class Args:
     target_kl: Optional[float] = None
     """the target KL divergence threshold"""
 
-    # to be filled in runtime
     batch_size: int = 0
     """the batch size (computed in runtime)"""
     minibatch_size: int = 0
@@ -266,7 +217,6 @@ def layer_init(layer: nn.Linear, std: float = np.sqrt(2), bias_const: float = 0.
 
 
 def masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """Mean of `x` over the entries where `mask` is 1."""
     return (x * mask).sum() / mask.sum().clamp(min=1.0)
 
 
@@ -291,7 +241,6 @@ def cell_identity(args: Args) -> Dict[str, object]:
 
 
 def git_sha() -> Optional[str]:
-    """The repository's HEAD, or None if git cannot answer."""
     try:
         result = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -306,14 +255,7 @@ def git_sha() -> Optional[str]:
 
 
 def read_xlogfile(path: pathlib.Path, offset: int) -> Tuple[Dict[str, str], int]:
-    """The newest complete record past `offset`, and the offset after it.
-
-    NetHack appends one tab-separated `key=value` line per finished game. It
-    writes nothing for an episode gymnasium's `TimeLimit` truncated, because
-    that game is still running, so a caller that reads unconditionally would
-    attribute some earlier episode's character to it. Reading from `offset`
-    makes that visible as an empty record rather than as a plausible one.
-    """
+    """Newest complete record past `offset`. Truncation writes nothing, so an empty record is not some earlier episode's character."""
     with open(path, "rb") as handle:
         handle.seek(offset)
         new = handle.read()
@@ -364,7 +306,6 @@ def save_checkpoint(
 
 
 def _step_to_range(delta: float, num_steps: int) -> torch.Tensor:
-    """Range of `num_steps` integers with distance `delta` centered around zero."""
     return delta * torch.arange(-num_steps // 2, num_steps // 2)
 
 
@@ -389,7 +330,6 @@ class Crop(nn.Module):
         self.register_buffer("height_grid", height_grid.clone())
 
     def forward(self, inputs: torch.Tensor, coordinates: torch.Tensor) -> torch.Tensor:
-        """Crop [B x H x W] inputs, centred on the [B x 2] x,y coordinates."""
         assert inputs.shape[1] == self.height
         assert inputs.shape[2] == self.width
 
@@ -432,9 +372,7 @@ class NetHackEncoder(nn.Module):
 
         self.crop = Crop(self.height, self.width, self.crop_dim, self.crop_dim)
 
-        # MAX_GLYPH + 1, not MAX_GLYPH as upstream: the glyph space is
-        # Box(low=0, high=MAX_GLYPH) with an inclusive high, so MAX_GLYPH is a
-        # legal glyph and upstream's table is one row short of indexing it.
+        # MAX_GLYPH + 1: Box high is inclusive, so MAX_GLYPH is a legal glyph
         self.embed = nn.Embedding(nethack.MAX_GLYPH + 1, self.k_dim)
 
         kernel, stride, padding = 3, 1, 1
@@ -480,8 +418,7 @@ class NetHackEncoder(nn.Module):
         )
 
     def _select(self, embed: nn.Embedding, x: torch.Tensor) -> torch.Tensor:
-        # index_select rather than calling the module: nn.Embedding's backward
-        # pass is slow, https://github.com/pytorch/pytorch/issues/24912
+        # index_select: nn.Embedding backward is slow, https://github.com/pytorch/pytorch/issues/24912
         out = embed.weight.index_select(0, x.reshape(-1))
         return out.reshape(x.shape + (-1,))
 
@@ -520,12 +457,7 @@ class Agent(nn.Module):
         available: torch.Tensor,
         action: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Sample or score an action under the policy masked to `available`.
-
-        `available` is positional and required: the loss must mask with the same
-        mask that gated the stored action, or the importance ratio is taken
-        between two differently normalised distributions.
-        """
+        """The loss must reuse the mask that gated the stored action, or the ratio is between two distributions."""
         hidden = self.encoder(obs["glyphs"], obs["blstats"])
         logits = self.actor(hidden)
         logits = torch.where(available, logits, torch.full_like(logits, MASKED_LOGIT))
@@ -571,24 +503,17 @@ if __name__ == "__main__":
     )
 
     identity = cell_identity(args)
-    # per seed, not per cell: main.py runs the seeds of one cell concurrently
-    # into one directory, and two processes appending to one file race on the
-    # header and interleave their rows. The `seed` column makes the union of a
-    # cell's files the same table the single file used to be.
+    # per seed: concurrent seeds in one directory would race on a shared file
     csv_path = run_dir / f"episodes_seed{args.seed}.csv"
     csv_file = open(csv_path, "a", newline="")
     csv_writer = csv.DictWriter(csv_file, fieldnames=list(EPISODE_COLUMNS))
     if csv_path.stat().st_size == 0:
         csv_writer.writeheader()
     episode_rows: List[Dict[str, object]] = []
-    """Finished episodes since the last flush. Written per update rather than
-    per episode: at NLE episode rates a flush per episode is a syscall on a
-    shared filesystem inside the rollout."""
+    """Flushed per update. A flush per episode is a syscall inside the rollout."""
 
     host = socket.gethostname()
-    # unconditional, and not named meta.json: main.py's finish_cell owns that
-    # name and only reaches it when every seed of the cell succeeded, which
-    # leaves a partially-failed group with no provenance at all
+    # not `meta.json`: main.py writes that only when every seed of the cell succeeded
     (run_dir / f"provenance_seed{args.seed}.json").write_text(
         json.dumps(
             {
@@ -605,7 +530,6 @@ if __name__ == "__main__":
     if args.log_trace:
         trace_dir.mkdir(parents=True, exist_ok=True)
 
-    # TRY NOT TO MODIFY: seeding
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -614,10 +538,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
     print(device)
 
-    # env setup. Sync, not async: an NLE step is ~7 us against ~1 ms of
-    # per-vector-step IPC, so async loses at the option durations this
-    # catalogue produces. NEXT_STEP is explicit because the primitive-step
-    # accounting below depends on the phantom transition landing where it does.
+    # Sync: NLE step is cheaper than vector IPC. NEXT_STEP: phantom accounting depends on it.
     envs = gym.vector.SyncVectorEnv(
         [
             make_env(
@@ -644,7 +565,6 @@ if __name__ == "__main__":
     agent = Agent(envs).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
-    # ALGO Logic: Storage setup
     obs = {
         key: torch.zeros(
             (args.num_steps, args.num_envs) + envs.single_observation_space[key].shape,
@@ -664,7 +584,6 @@ if __name__ == "__main__":
     values = torch.zeros((args.num_steps, args.num_envs)).to(device)
     available = torch.zeros((args.num_steps, args.num_envs, num_actions), dtype=torch.bool, device=device)
 
-    # per-episode accumulation, one lane per env, all of it numpy over the batch
     ep_return_decision = np.zeros(args.num_envs, dtype=np.float64)
     ep_return_primitive = np.zeros(args.num_envs, dtype=np.float64)
     ep_clipped_return = np.zeros(args.num_envs, dtype=np.float64)
@@ -685,8 +604,7 @@ if __name__ == "__main__":
     ep_option_peak = np.zeros((args.num_envs, num_actions), dtype=np.int64)
     ep_option_cause = np.zeros((args.num_envs, num_actions, len(TERM_CAUSE_NAMES)), dtype=np.int64)
 
-    # `option_calls` is the tail of the table, because `make_options` emits the
-    # primitives first and the chosen rows after them
+    # `option_calls` is the tail: `make_options` emits primitives first
     if args.condition == "action":
         n_primitives = num_actions
     elif args.condition == "option":
@@ -694,10 +612,7 @@ if __name__ == "__main__":
     else:
         n_primitives = num_actions - args.n_options
 
-    # private, and the only handle on it: NLE gives each `Nethack` its own
-    # `tempfile.TemporaryDirectory`, so these are distinct and their last lines
-    # cannot interleave. Asserted rather than assumed, because two envs sharing
-    # one would attribute the wrong character to the wrong lane in silence.
+    # one xlogfile per env; shared would mis-attribute character
     xlog_paths = [pathlib.Path(env.unwrapped.nethack._vardir) / "xlogfile" for env in envs.envs]
     assert len(set(xlog_paths)) == args.num_envs, f"envs share an xlogfile: {xlog_paths}"
     xlog_offsets = [0] * args.num_envs
@@ -709,13 +624,12 @@ if __name__ == "__main__":
     trace_blstats_indices = [BLSTATS_INDEX[name] for name in TRACE_BLSTATS_FIELDS]
 
     def to_device(observation: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:
-        """Move the encoder's observation keys onto the device, dropping the rest."""
+        """Encoder keys only. The wrapper's extra obs keys stay on the host."""
         return {
             key: torch.as_tensor(observation[key], dtype=dtype, device=device)
             for key, dtype in ENCODER_OBS_DTYPE.items()
         }
 
-    # TRY NOT TO MODIFY: start the game
     frames = 0
     decisions = 0
     iteration = 0
@@ -734,9 +648,7 @@ if __name__ == "__main__":
 
     while frames < args.budget:
         iteration += 1
-        # read before the rollout advances `frames`, so the rate is the one this
-        # iteration starts on and is constant across its minibatches. Clamped at
-        # zero: an overrun would otherwise turn into gradient ascent.
+        # before `frames` advances; clamped so overrun is not ascent
         if args.anneal_lr:
             frac = max(1.0 - frames / args.budget, 0.0)
             lrnow = frac * args.learning_rate
@@ -751,28 +663,23 @@ if __name__ == "__main__":
                 next_fallback_np, dtype=torch.float32, device=device
             )
 
-            # ALGO LOGIC: action logic
             with torch.no_grad():
                 action, logprob, _, value = agent.get_action_and_value(next_obs, next_available)
                 values[step] = value.flatten()
             actions[step] = action
             logprobs[step] = logprob
 
-            # the transition a NEXT_STEP autoreset inserts is the one whose
-            # predecessor was done, so it is read here, before the step
-            # overwrites the flag. It belongs to no episode.
+            # NEXT_STEP phantom: predecessor was done; read before step overwrites it
             live = np.logical_not(next_done_np)
             # previous-step flag: the mask this action was sampled under
             chose_on_fallback = next_fallback_np
 
-            # TRY NOT TO MODIFY: execute the game and log data.
             action_np = action.cpu().numpy()
             next_obs_np, reward, terminations, truncations, infos = envs.step(action_np)
             next_done_np = np.logical_or(terminations, truncations)
             rewards[step] = torch.as_tensor(reward, dtype=torch.float32, device=device).view(-1)
 
-            # `_add_info` zero-fills a key an env did not report, so a missing
-            # mask would silently read as zero primitive steps rather than fail
+            # `_add_info` zero-fills a missing key, so a missing mask would read as 0 steps
             assert infos["_primitive_steps"].all(), "the env must emit `primitive_steps` every step"
             steps_taken = infos["primitive_steps"]
             frames += int(steps_taken.sum())
@@ -799,11 +706,7 @@ if __name__ == "__main__":
             next_obs = to_device(next_obs_np)
             next_done = torch.as_tensor(next_done_np, dtype=torch.float32, device=device)
 
-            # episode accumulation, vectorised over the batch and masked to the
-            # live lanes. The wrapper's reward is discounted within the option,
-            # which is what the primitive clock wants; the decision clock needs
-            # the undiscounted sum, so one convention cannot be derived from the
-            # other here and both are carried.
+            # wrapper reward is intra-option discounted (primitive clock); decision clock needs the undiscounted sum
             undiscounted = infos["undiscounted_reward"]
             ingame_blstats = infos["ingame_blstats"]
             term_cause = infos["term_cause"]
@@ -814,10 +717,7 @@ if __name__ == "__main__":
             ep_sum_negative += live * infos["sum_negative_clipped"]
             ep_nonzero_steps += live * infos["nonzero_reward_steps"]
 
-            # the wrapper's offset is inside the decision, so it only becomes an
-            # episode index once the primitives before this decision are added.
-            # Written once and then frozen, so a later rewarding decision cannot
-            # move it.
+            # wrapper offset is inside the decision; freeze after first hit
             first_offset = infos["first_reward_offset"]
             first_hit = live & (ep_steps_to_first < 0) & (first_offset >= 0)
             ep_steps_to_first[first_hit] = ep_primitive_count[first_hit] + first_offset[first_hit]
@@ -832,8 +732,7 @@ if __name__ == "__main__":
             live_ids = action_np[live_rows]
             # `TERM_NONE` is -1 and would wrap
             assert (term_cause[live_rows] >= 0).all(), "a live decision reported no cause"
-            # the row indices are distinct, so these are scatters rather than
-            # read-modify-writes and need no `np.add.at`
+            # distinct row indices: scatters, not `np.add.at`
             ep_option_n[live_rows, live_ids] += 1
             ep_option_steps[live_rows, live_ids] += steps_taken[live_rows]
             ep_option_peak[live_rows, live_ids] = np.maximum(
@@ -862,16 +761,13 @@ if __name__ == "__main__":
                     end_status = int(infos["end_status"][env_index])
                     solved = int(end_status == TASK_SUCCESSFUL)
                     # if no `paid`, use `solved`
-             
                     paid_mask = infos.get("_paid")
                     paid = (
                         int(infos["paid"][env_index])
                         if paid_mask is not None and paid_mask[env_index]
                         else solved
                     )
-                    # only where the game itself ended: a gymnasium truncation
-                    # leaves it running and unrecorded, and reading anyway would
-                    # take some earlier episode's record for this one
+                    # truncation leaves the game running and unrecorded
                     character = dict.fromkeys(XLOGFILE_FIELDS, "")
                     if end_status != STATUS_RUNNING:
                         record, xlog_offsets[env_index] = read_xlogfile(
@@ -883,9 +779,7 @@ if __name__ == "__main__":
 
                     peak_frame = ep_peak_blstats[env_index]
                     last_frame = ingame_blstats[env_index]
-                    # printable only: the message line carries whatever the agent
-                    # typed into a prompt, and one control byte in a CSV field is
-                    # a new row to half the readers that will open this
+                    # printable: a control byte in a CSV field is a new row to some readers
                     message = (
                         bytes(infos["ingame_message"][env_index])
                         .split(b"\0")[0]
@@ -997,7 +891,6 @@ if __name__ == "__main__":
                 },
             )
 
-        # bootstrap value if not done
         with torch.no_grad():
             next_value = agent.get_value(next_obs).reshape(1, -1)
             advantages = torch.zeros_like(rewards).to(device)
@@ -1013,7 +906,6 @@ if __name__ == "__main__":
                 advantages[t] = lastgaelam = delta + discounts[t] * args.gae_lambda * nextnonterminal * lastgaelam
             returns = advantages + values
 
-        # flatten the batch
         b_obs = {key: value.reshape((-1,) + value.shape[2:]) for key, value in obs.items()}
         b_logprobs = logprobs.reshape(-1)
         b_actions = actions.reshape(-1)
@@ -1021,13 +913,9 @@ if __name__ == "__main__":
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
         b_available = available.reshape(-1, num_actions)
-        # a NEXT_STEP autoreset inserts one transition per episode holding the
-        # terminal observation, an action the env discarded and zero reward. It
-        # is exactly the transition whose `dones` is set, so no extra buffer is
-        # needed to find it, and it is excluded from every reduction below.
+        # NEXT_STEP phantom is the `dones` transition; excluded from every reduction below
         b_masks = (1.0 - dones).reshape(-1)
 
-        # Optimizing the policy and value network
         b_inds = np.arange(args.batch_size)
         clipfracs = []
         grad_norms = []
@@ -1046,7 +934,7 @@ if __name__ == "__main__":
                 ratio = logratio.exp()
 
                 with torch.no_grad():
-                    # calculate approx_kl http://joschu.net/blog/kl-approx.html
+                    # http://joschu.net/blog/kl-approx.html
                     old_approx_kl = masked_mean(-logratio, mb_masks)
                     approx_kl = masked_mean((ratio - 1) - logratio, mb_masks)
                     clipfracs += [
@@ -1059,12 +947,10 @@ if __name__ == "__main__":
                     mb_var = masked_mean((mb_advantages - mb_mean) ** 2, mb_masks)
                     mb_advantages = (mb_advantages - mb_mean) / (mb_var.sqrt() + 1e-8)
 
-                # Policy loss
                 pg_loss1 = -mb_advantages * ratio
                 pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
                 pg_loss = masked_mean(torch.max(pg_loss1, pg_loss2), mb_masks)
 
-                # Value loss
                 newvalue = newvalue.view(-1)
                 if args.clip_vloss:
                     v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
@@ -1097,7 +983,6 @@ if __name__ == "__main__":
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
-        # TRY NOT TO MODIFY: record rewards for plotting purposes
         writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], frames)
         writer.add_scalar("losses/value_loss", v_loss.item(), frames)
         writer.add_scalar("losses/policy_loss", pg_loss.item(), frames)
@@ -1109,10 +994,7 @@ if __name__ == "__main__":
         print("SPS:", int(frames / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(frames / (time.time() - start_time)), frames)
 
-        # option diagnostics, over non-phantom transitions only: the autoreset
-        # transition would otherwise contribute an action the env discarded and
-        # a terminal state the policy never acted in, and its share of the
-        # buffer is condition-dependent
+        # non-phantom only: share of the buffer is condition-dependent
         live = 1.0 - dones
         live_rows = live.bool()
         writer.add_scalar("option/steps_mean", masked_mean(primitive_steps, live).item(), frames)
@@ -1124,7 +1006,6 @@ if __name__ == "__main__":
             .item(),
             frames,
         )
-        # inherited a modal state and drained it
         writer.add_scalar(
             "option/drain_frac", masked_mean((drain_steps > 0).float(), live).item(), frames
         )
@@ -1142,9 +1023,7 @@ if __name__ == "__main__":
             writer.add_scalar(
                 "option/entropy_ceiling_std", n_available.log().std(unbiased=False).item(), frames
             )
-            # histograms rather than scalars: both are length-num_actions
-            # distributions over the action index, and `add_scalar` cannot carry
-            # a vector. Samples, not counts, so tensorboard bins them itself.
+            # `add_scalar` cannot carry a vector; samples, not counts
             writer.add_histogram("option/selected", actions[live_rows].long(), frames)
             writer.add_histogram("option/offered", available_live.nonzero()[:, 1], frames)
 
@@ -1152,8 +1031,7 @@ if __name__ == "__main__":
         writer.add_scalar("iter/decisions", decisions, frames)
         writer.add_scalar("iter/updates", updates, frames)
         writer.add_scalar("iter/learning_rate", optimizer.param_groups[0]["lr"], frames)
-        # pre-clip norm, once per minibatch, so a single scalar per iteration
-        # would be ambiguous. The max decides whether max_grad_norm clips always.
+        # pre-clip, per minibatch
         writer.add_scalar("iter/grad_norm_mean", float(np.mean(grad_norms)), frames)
         writer.add_scalar("iter/grad_norm_max", float(np.max(grad_norms)), frames)
 

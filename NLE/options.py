@@ -8,9 +8,7 @@ from nle import nethack
 from nle.env.base import NLE
 
 MOVE_REPEATS = [1, 2, 4, 8, 16]
-"""The reach ladder. A module constant, not a per-cell argument: the catalogue's
-size is a function of the action set, so there is no `max_forward` analogue to
-sweep, and exp3's `duration_vs_cap` is skipped for want of a second cap."""
+"""Reach ladder. Module constant: catalogue size is a function of the action set."""
 
 COMPASS = [
     nethack.CompassDirection.N,
@@ -64,28 +62,15 @@ DIR_COMMANDS = [
 INVENTORY_SLOTS = "abcdefghij"
 
 CONCEDING_COMMANDS = (nethack.Command.QUIT, nethack.Command.SAVE)
-"""Kept out of the action table in every condition.
+"""Out of every condition's table, not the env action set (catalogue indices stay fixed).
 
-`QUIT` followed by `y` ends the episode in two primitive steps with reward 0,
-and `NetHackChallenge` sets `allow_all_yn_questions=True`, so the confirmation
-is answerable. Since the reward is a score delta plus a per-step time penalty,
-conceding beats any trajectory whose future score does not cover the penalty,
-and it is reachable from the first move.
-
-Removing them is what NLE itself does whenever the env has a goal: the goal
-tasks run on `TASK_ACTIONS`, 23 keys, which contains neither. `NetHackChallenge`
-carries them because a competition entry has to be able to concede.
-
-They are dropped from the table rather than from the env's action set, so the
-keystroke indices a catalogue row holds stay the same on every env.
-
-`MiscDirection.UP` is out of the option catalogue and kept in the primitive
-table: two-decision reward-0 exit under `option`; `TASK_ACTIONS` contains `UP`.
-See `test_options.KNOWN_TURN_ONE_ESCAPES`.
+`QUIT` then `y` is a two-step reward-0 exit (`allow_all_yn_questions=True`). `UP`
+is out of the option catalogue only; `TASK_ACTIONS` contains it. See
+`test_options.KNOWN_TURN_ONE_ESCAPES`.
 """
 
 EMPTY_SLOT = 0
-"""`inv_letters` pads unoccupied slots with 0 rather than a letter."""
+"""`inv_letters` pads empty slots with 0, not a letter."""
 
 UNPROMPTED_COMMANDS = (nethack.Command.FIGHT,)
 """`FIGHT` takes a direction with no prompt, so its argument is unconditional."""
@@ -103,16 +88,13 @@ EFFECT_UNKNOWN = 0
 EFFECT_TAKE = 1
 EFFECT_PUT = 2
 EFFECT_DOOR = 3
-"""What an executed row should have changed, for `interact_failed`.
-`EFFECT_UNKNOWN` is not decidable from the observation and reports no failure."""
+"""What `interact_failed` diffs. `EFFECT_UNKNOWN` reports no failure."""
 
 NO_HEADING = -1
-"""`heading` on a row with no direction, so the field is an index into `COMPASS`
-everywhere else."""
+"""`heading` when the row has no direction; otherwise an index into `COMPASS`."""
 
 COMPASS_OFFSETS = [(0, -1), (0, 1), (1, 0), (-1, 0), (1, -1), (-1, -1), (1, 1), (-1, 1)]
-"""`(dx, dy)` per `COMPASS` entry, positionally. North is `dy == -1`: row 0 of
-`glyphs` is the top of the map."""
+"""`(dx, dy)` per `COMPASS` entry. North is `dy == -1`: row 0 of `glyphs` is the top."""
 
 CMAP_OPEN_DOOR = (13, 14)
 CMAP_CLOSED_DOOR = (15, 16)
@@ -137,7 +119,6 @@ DIR_EFFECT = {
 }
 
 ARGUMENT_STEP_LIMIT = 2
-"""Keystrokes a command-plus-argument row may emit: the command and the argument."""
 
 DRAIN_KEY = nethack.Command.ESC
 """Clears all three `misc` fields. Space reprints a repeating `--More--`."""
@@ -146,9 +127,7 @@ DRAIN_LIMIT = 128
 """Hang guard. The drain runs until `misc` is clear, no allowance."""
 
 STATUS_ABORTED = int(NLE.StepStatus.ABORTED)
-"""`end_status` when NLE ended the episode on its own step limit or its
-no-progress timeout, rather than the game ending. Read off the class rather
-than written as a literal."""
+"""`end_status` when NLE abort (step limit / no-progress), not the game."""
 
 TERM_NONE = -1
 TERM_SEQUENCE = 0
@@ -164,16 +143,13 @@ MISC_IN_YN = 0
 STATUS_KEY = 0
 STATUS_ARGUMENT = 1
 STATUS_DONE = 2
-"""Command, argument, or stop."""
 
 GROUP_PRIMITIVE = -1
 GROUP_MOVE = 0
 GROUP_SINGLE = 1
 GROUP_ARG = 2
 GROUP_DIR = 3
-"""Which class of the enumeration a row came from. The order of the four
-catalogue groups is the order `_catalogue` emits them in, and both grammar
-priors read it."""
+"""Catalogue group. Emission order; both grammar priors read it."""
 
 
 class OptionRow(NamedTuple):
@@ -182,9 +158,9 @@ class OptionRow(NamedTuple):
     key: int
     name: str
     slot: Optional[int]
-    """ASCII code of the inventory letter this row needs, or None if it needs none."""
+    """Inventory letter ASCII, or None."""
     reach: int
-    """Primitive moves a movement row makes; 0 for a command row."""
+    """Movement reach; 0 for a command row."""
     group: int
     argument: Optional[int]
     """Slot letter or direction index, or None."""
@@ -198,21 +174,12 @@ class OptionRow(NamedTuple):
 
     @property
     def keystrokes(self) -> Tuple[int, ...]:
-        """Keys the row can emit, for reporting."""
+        """For reporting. The executor derives its own keys."""
         return (self.key,) if self.argument is None else (self.key, self.argument)
 
 
 def _catalogue(env_actions: Sequence[Any]) -> List[OptionRow]:
-    """Every option this action set admits, in the frozen canonical order.
-
-    That order is the contract both grammar prefixes and the random draw are
-    taken from, so changing it redraws every family and invalidates every run
-    that used one. Rows whose keys the action set lacks are skipped, so the
-    length is a function of the action set rather than the 187 of the full
-    keyboard.
-
-    No trailing ESC; leftover prompts are drained.
-    """
+    """Every option this action set admits, frozen order. Changing it redraws every family."""
     index = {a: i for i, a in enumerate(env_actions)}
     rows: List[OptionRow] = []
 
@@ -308,12 +275,7 @@ def _catalogue(env_actions: Sequence[Any]) -> List[OptionRow]:
 
 
 def _class_rank(rows: Sequence[OptionRow]) -> Dict[str, int]:
-    """Each row's position inside its own group, keyed by name.
-
-    One rule for all four groups: longest reach first, then canonical order.
-    Where a group's rows all have reach 0 that reduces to canonical order, and on
-    the movement rows it is reach-major, which is what both priors want.
-    """
+    """Position inside the row's group. Longest reach first, then catalogue order."""
     keyed: Dict[int, List[Tuple[int, int, str]]] = {}
     for position, row in enumerate(rows):
         keyed.setdefault(row.group, []).append((-row.reach, position, row.name))
@@ -325,13 +287,7 @@ def _class_rank(rows: Sequence[OptionRow]) -> Dict[str, int]:
 
 
 def grammar_options(n: int, rows: Sequence[OptionRow]) -> List[OptionRow]:
-    """The first n rows breadth-first: contingent rows last, then one row from
-    each group in turn, each group longest-reach-first.
-
-    This is what `grammar` means in every experiment that names it. At n=8 it
-    reaches three of the four groups, so the prefix can descend a staircase and
-    open a door rather than only walk.
-    """
+    """First n breadth-first: contingent last, then one per group, longest-reach first."""
     rank = _class_rank(rows)
     ordered = sorted(
         rows, key=lambda row: (row.slot is not None, rank[row.name], row.group)
@@ -340,14 +296,8 @@ def grammar_options(n: int, rows: Sequence[OptionRow]) -> List[OptionRow]:
 
 
 def grammar_depth_options(n: int, rows: Sequence[OptionRow]) -> List[OptionRow]:
-    """The first n rows longest-reach-first, transliterating Navix's
-    `(follow, -reach, rank, heading)`.
-
-    Its prefix is every movement row before any command row, so it holds no
-    interaction below n=41. exp3 is the only sweep that runs it.
-    """
-    # `sorted` is stable, so canonical order is the last tiebreak without the
-    # enumeration index appearing in the key
+    """First n longest-reach-first. No command row before n=41."""
+    # `sorted` is stable, so catalogue order is the last tiebreak without an index in the key
     ordered = sorted(rows, key=lambda row: (row.slot is not None, -row.reach, row.group))
     return list(ordered[:n])
 
@@ -355,17 +305,13 @@ def grammar_depth_options(n: int, rows: Sequence[OptionRow]) -> List[OptionRow]:
 def random_options(
     n: int, rows: Sequence[OptionRow], option_seed: int
 ) -> List[OptionRow]:
-    """Uniform draws from the catalogue, seeded by `option_seed`."""
-    # by name, not by the canonical order and not by the index tuples:
-    # `random.sample` reads its input positionally, so the draw would move
-    # whenever the enumeration order changed, and an index tuple moves with the
-    # action set. A name moves under neither.
+    # by name: `random.sample` is positional, so catalogue order or action-set indices would redraw
     ordered = sorted(rows, key=lambda row: row.name)
     return random.Random(option_seed).sample(ordered, n)
 
 
 def catalogue_digest(rows: Sequence[OptionRow]) -> str:
-    """sha256 of the row names in order, for pinning the enumeration in a test."""
+    """sha256 of the row names in order."""
     return hashlib.sha256("\n".join(row.name for row in rows).encode()).hexdigest()
 
 
@@ -375,7 +321,6 @@ def select_options(
     option_family: Literal["grammar", "grammar_depth", "random"],
     option_seed: int,
 ) -> List[OptionRow]:
-    """`n_options` rows of `rows` under the named prior."""
     if n_options > len(rows):
         raise ValueError(
             f"asked for {n_options} options but this action set yields only "
@@ -408,7 +353,7 @@ def make_options(
     option_family: Literal["grammar", "grammar_depth", "random"],
     option_seed: int,
 ) -> Tuple[List[OptionRow], List[str], List[Optional[int]]]:
-    """Action table for `condition`. A primitive is `step_limit == 1`."""
+    """Action table for `condition`. A primitive is `step_limit == 1`. `both` is primitives then options."""
     primitives = [
         OptionRow(
             key=i,
@@ -437,20 +382,16 @@ def make_options(
 
 
 def _is_closed_door(glyph: int) -> bool:
-    """Whether `glyph` is a closed or locked door."""
+    """Closed or locked. Glyph cannot tell them apart."""
     return nethack.glyph_is_cmap(glyph) and nethack.glyph_to_cmap(glyph) in CMAP_CLOSED_DOOR
 
 
 def _is_open_door(glyph: int) -> bool:
-    """Whether `glyph` is a door standing open."""
     return nethack.glyph_is_cmap(glyph) and nethack.glyph_to_cmap(glyph) in CMAP_OPEN_DOOR
 
 
 def _is_walkable(glyph: int, diagonal: bool) -> bool:
-    """Whether one move into `glyph` can leave this cell.
-
-    Diagonal into cmap 13/14 is refused; cmap 12 is not.
-    """
+    """Diagonal into cmap 13/14 is refused; cmap 12 is not."""
     if not nethack.glyph_is_cmap(glyph):
         return True
     cmap = nethack.glyph_to_cmap(glyph)
@@ -465,11 +406,10 @@ MAP_PREDICATE = {
     NEEDS_MONSTER: nethack.glyph_is_monster,  # pets included
     NEEDS_TRAP: nethack.glyph_is_trap,
 }
-"""What each map requirement wants to find in the cell along a row's heading."""
 
 
 def _neighbour_glyphs(glyphs: np.ndarray, x: int, y: int) -> np.ndarray:
-    """The eight glyphs around `(x, y)` in `COMPASS` order, `NO_GLYPH` off-map."""
+    """Eight neighbours in `COMPASS` order, `NO_GLYPH` off-map."""
     height, width = glyphs.shape
     return np.array(
         [
@@ -528,13 +468,10 @@ class OptionWrapper(gym.Wrapper):
         """Modal flag still set when the previous decision ended."""
         self._ingame_blstats = np.zeros(0, dtype=np.int64)
         self._ingame_message = np.zeros(0, dtype=np.uint8)
-        """The last frame with a turn on it, which outlives the episode: NetHack
-        zeroes blstats and message once the game is over, so a decision that
-        ends the episode has no readable state of its own."""
+        """Last frame with a turn; NetHack zeroes blstats/message at game over."""
         self._begin_decision()
 
     def _begin_decision(self) -> None:
-        """Clear the per-decision reward tally."""
         self._steps = 0
         self._undiscounted = 0.0
         self._positive = 0.0
@@ -560,9 +497,7 @@ class OptionWrapper(gym.Wrapper):
             int(obs["blstats"][nethack.NLE_BL_Y]),
         )
         if obs["blstats"][nethack.NLE_BL_TIME] > 0:
-            # copies, not views: NLE writes every step into the same two buffers,
-            # so a view would follow the game to the zeroed terminal frame and
-            # every snapshot taken this episode would read as that frame
+            # copies, not views: NLE reuses the same two buffers
             self._ingame_blstats = obs["blstats"].copy()
             self._ingame_message = obs["message"].copy()
         return obs, reward, terminated, truncated, info
@@ -589,9 +524,9 @@ class OptionWrapper(gym.Wrapper):
     def _initiation(self, obs: Dict[str, np.ndarray]) -> np.ndarray:
         """`I` as a bool mask.
 
-        Movement needs the first cell walkable: not stone, walls, or a closed
-        door; diagonal refuses cmap 13/14, not doorway 12. Empty mask offers
-        everything (`grammar_depth` n<=40 is movement only).
+        Movement: first cell walkable (not stone/walls/closed door; diagonal
+        refuses cmap 13/14, not doorway 12). Empty mask offers everything
+        (`grammar_depth` n<=40 is movement only).
         """
         self._neighbours = _neighbour_glyphs(
             obs["glyphs"],

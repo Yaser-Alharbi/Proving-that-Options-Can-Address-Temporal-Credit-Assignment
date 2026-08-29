@@ -14,6 +14,7 @@ import itertools
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import time
@@ -33,7 +34,7 @@ DEPTH_FAMILY_TAG = "exp3"
 """The only sweep allowed to name `grammar_depth`, so that `grammar` denotes one
 catalogue in every figure. Asserted by test_only_exp3_names_the_depth_prior."""
 
-FULL_CATALOGUE = 188
+FULL_CATALOGUE = 187
 """Rows `NetHackChallenge-v0`'s action set admits, so exp2's last n is the whole
 catalogue and its top point is not a family-dependent draw. `preflight` checks it
 against the realised size rather than trusting it."""
@@ -48,6 +49,10 @@ LAUNCH_STAGGER_SECONDS = 20.0
 "failed to map segment from shared object"; twenty seconds apart mostly do not."""
 
 POLL_SECONDS = 5.0
+STATUS_EVERY_SECONDS = 600.0
+
+_SPS_RE = re.compile(r"^SPS: (\d+)\s*$", re.MULTILINE)
+_FRAMES_RE = re.compile(r"^frames=(\d+),", re.MULTILINE)
 
 PILOT_SEEDS: Tuple[int, ...] = tuple(range(3))
 """The working default. Enough to see whether a condition separates at all, not
@@ -123,7 +128,7 @@ SWEEPS: Dict[str, Sweep] = {
         CellArgs(tag="exp2"),
         n_options=(8, 16, 32, 64, 128, FULL_CATALOGUE),
     ),
-    # n=64, not the full catalogue: at 188 every family returns the whole thing
+    # n=64, not the full catalogue: at 187 every family returns the whole thing
     # and the three coincide
     "exp3": Sweep(
         CellArgs(tag="exp3"),
@@ -361,6 +366,10 @@ def ppo_command(cell: Cell, seed: int) -> List[str]:
     ]
 
 
+def seed_log(job: Job) -> pathlib.Path:
+    return job.cell.directory / f"seed{job.seed}.log"
+
+
 def launch(job: Job, gpu: int) -> Running:
     """Start one seed pinned to one GPU, its output going to its own log.
 
@@ -369,7 +378,7 @@ def launch(job: Job, gpu: int) -> Running:
     every cell defaults to device 0 and contends there.
     """
     job.cell.directory.mkdir(parents=True, exist_ok=True)
-    log = (job.cell.directory / f"seed{job.seed}.log").open("w")
+    log = seed_log(job).open("w")
     process = subprocess.Popen(
         ppo_command(job.cell, job.seed),
         cwd=str(HERE),
@@ -387,6 +396,71 @@ def launch(job: Job, gpu: int) -> Running:
     return Running(process=process, job=job, gpu=gpu, log=log)
 
 
+def log_progress(path: pathlib.Path) -> Tuple[Optional[int], Optional[int]]:
+    if not path.exists():
+        return None, None
+    text = path.read_text(encoding="utf-8", errors="replace")
+    frames, sps = _FRAMES_RE.findall(text), _SPS_RE.findall(text)
+    return (
+        int(frames[-1]) if frames else None,
+        int(sps[-1]) if sps else None,
+    )
+
+
+def remaining_seconds(
+    budget: int, frames: Optional[int], sps: Optional[int]
+) -> Optional[float]:
+    if frames is None or sps is None or sps <= 0:
+        return None
+    return max(budget - frames, 0) / sps
+
+
+def pool_eta(
+    running_remaining: Sequence[Optional[float]],
+    pending_durations: Sequence[Optional[float]],
+    capacity: int,
+) -> Optional[float]:
+    if None in running_remaining or None in pending_durations:
+        return None
+    slots = sorted(t for t in running_remaining if t is not None)
+    slots.extend([0.0] * max(capacity - len(slots), 0))
+    for duration in pending_durations:
+        assert duration is not None
+        slots[0] += duration
+        slots.sort()
+    return max(slots)
+
+
+def print_status(
+    n_jobs: int,
+    running: Sequence[Running],
+    pending: Sequence[Job],
+    capacity: int,
+    rates: Dict[Condition, int],
+) -> None:
+    n_done = n_jobs - len(pending) - len(running)
+    line = f"{n_done}/{n_jobs} done  {len(running)} run  {len(pending)} queued"
+    if running or pending:
+        eta = pool_eta(
+            [
+                remaining_seconds(e.job.cell.args.budget, *log_progress(seed_log(e.job)))
+                for e in running
+            ],
+            [
+                remaining_seconds(j.cell.args.budget, 0, rates.get(j.cell.args.condition))
+                for j in pending
+            ],
+            capacity,
+        )
+        if eta is None:
+            line += "  eta —"
+        elif eta >= 3600:
+            line += f"  eta {eta / 3600:.1f}h"
+        else:
+            line += f"  eta {int(round(eta / 60.0))}m"
+    print(f"\n{line}", flush=True)
+
+
 def run_pool(
     jobs: Sequence[Job], gpus: Sequence[int], per_gpu: int, stagger: float
 ) -> List[Job]:
@@ -400,6 +474,14 @@ def run_pool(
     load = {gpu: 0 for gpu in gpus}
     failures: List[Job] = []
     capacity = per_gpu * len(gpus)
+    n_jobs = len(jobs)
+    last_status = time.time()
+    rates: Dict[Condition, int] = {}
+
+    def note_sps(job: Job) -> None:
+        sps = log_progress(seed_log(job))[1]
+        if sps is not None:
+            rates[job.cell.args.condition] = sps
 
     while pending or running:
         while pending and len(running) < capacity:
@@ -418,6 +500,7 @@ def run_pool(
 
         done = [entry for entry in running if entry.process.poll() is not None]
         for entry in done:
+            note_sps(entry.job)
             running.remove(entry)
             entry.log.close()
             load[entry.gpu] -= 1
@@ -430,6 +513,12 @@ def run_pool(
             )
             if code != 0:
                 failures.append(entry.job)
+        now = time.time()
+        if done or now - last_status >= STATUS_EVERY_SECONDS:
+            for entry in running:
+                note_sps(entry.job)
+            print_status(n_jobs, running, pending, capacity, rates)
+            last_status = now
         if not done:
             time.sleep(POLL_SECONDS)
 
@@ -464,7 +553,7 @@ def write_failures(group_directory: pathlib.Path, failures: Sequence[Job]) -> No
                 {
                     "cell": job.cell.name,
                     "seed": job.seed,
-                    "log": str(job.cell.directory / f"seed{job.seed}.log"),
+                    "log": str(seed_log(job)),
                     "command": ppo_command(job.cell, job.seed),
                 }
                 for job in failures

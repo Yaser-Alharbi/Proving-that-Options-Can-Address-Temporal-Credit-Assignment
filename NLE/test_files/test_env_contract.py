@@ -16,7 +16,7 @@ from envs import make_env
 NUM_ENVS = 2
 TRUNCATE_AT = 20
 CONSTANT_ACTION = 0
-FULL_CATALOGUE = 187
+FULL_CATALOGUE = 227
 """Every row `NetHackChallenge-v0` admits, so no test here is also a subsample."""
 
 
@@ -39,7 +39,12 @@ def env_thunk(idx: int, condition: str = "action") -> Callable[[], gym.Env]:
 
 @pytest.fixture(scope="module")
 def truncating_rollout() -> List[Tuple[np.ndarray, np.ndarray, np.ndarray, dict]]:
-    """One step past truncation. Truncation rather than death, so the ending step is exact."""
+    """Past truncation for every env. Truncation rather than death, so the ending step is exact.
+
+    Two steps of slack rather than one: a drain makes a decision cost more than one
+    primitive step, so truncation can land earlier than `TRUNCATE_AT` decisions in
+    and the autoreset step after it still has to be in the rollout.
+    """
     envs = gym.vector.SyncVectorEnv(
         [env_thunk(index) for index in range(NUM_ENVS)],
         autoreset_mode=gym.vector.AutoresetMode.NEXT_STEP,
@@ -47,38 +52,71 @@ def truncating_rollout() -> List[Tuple[np.ndarray, np.ndarray, np.ndarray, dict]
     envs.reset(seed=0)
     actions = np.full(NUM_ENVS, CONSTANT_ACTION, dtype=np.int64)
     steps = []
-    for _ in range(TRUNCATE_AT + 1):
+    for _ in range(TRUNCATE_AT + 2):
         _, reward, terminated, truncated, infos = envs.step(actions)
         steps.append((reward.copy(), terminated.copy(), truncated.copy(), infos))
     envs.close()
     return steps
 
 
+def truncation_step(
+    rollout: List[Tuple[np.ndarray, np.ndarray, np.ndarray, dict]], env_index: int
+) -> int:
+    """Index of the step `env_index` truncated on.
+
+    Derived rather than assumed: `max_episode_steps` bounds primitive steps, and a
+    decision that inherits a modal state drains it and spends more than one, so
+    which decision crosses the bound is a property of the rollout. `NetHackChallenge`
+    ignores `reset(seed=...)`, so it differs between runs.
+    """
+    for step, (_, _, truncated, _) in enumerate(rollout):
+        if truncated[env_index]:
+            return step
+    raise AssertionError(
+        f"env {env_index} never truncated in {len(rollout)} decisions, though "
+        f"max_episode_steps={TRUNCATE_AT} and every decision spends a step"
+    )
+
+
 def test_next_step_autoreset_emits_one_flagless_transition(
     truncating_rollout: List[Tuple[np.ndarray, np.ndarray, np.ndarray, dict]],
 ) -> None:
     """The step after an episode ends carries no flags, no reward and no steps. `ppo.py` finds it as `dones[step]`."""
-    reward, terminated, truncated, infos = truncating_rollout[TRUNCATE_AT - 1]
-    assert truncated.all(), "every env should truncate on its max_episode_steps-th step"
-    assert not terminated.any(), "truncation, not termination, is the mechanism under test"
-    assert (infos["primitive_steps"] == 1 + infos["drain_steps"]).all(), (
-        "the terminating decision consumed a primitive step and must be paid for, "
-        "plus any modal state it inherited and drained"
-    )
+    for env_index in range(NUM_ENVS):
+        end = truncation_step(truncating_rollout, env_index)
 
-    reward, terminated, truncated, infos = truncating_rollout[TRUNCATE_AT]
-    assert not terminated.any() and not truncated.any(), (
-        "the autoreset transition belongs to neither episode and must carry no flags"
-    )
-    assert (reward == 0.0).all(), "the autoreset transition must carry no reward"
-    assert (infos["primitive_steps"] == 0).all(), (
-        "the autoreset transition consumed no primitive steps, so it must cost the "
-        "budget nothing; a 1 here would let the option condition buy extra frames"
-    )
-    assert infos["_available"].all(), (
-        "`available` must survive the autoreset, or the first decision of every "
-        "episode is taken under a mask of zeros"
-    )
+        _, terminated, _, infos = truncating_rollout[end]
+        assert not terminated[env_index], (
+            "truncation, not termination, is the mechanism under test"
+        )
+        assert (
+            infos["primitive_steps"][env_index] == 1 + infos["drain_steps"][env_index]
+        ), (
+            "the terminating decision consumed a primitive step and must be paid for, "
+            "plus any modal state it inherited and drained"
+        )
+        spent = sum(
+            int(infos["primitive_steps"][env_index])
+            for _, _, _, infos in truncating_rollout[: end + 1]
+        )
+        assert spent == TRUNCATE_AT, (
+            "the budget is denominated in primitive steps, so the episode ends on "
+            "the decision whose step reaches max_episode_steps"
+        )
+
+        reward, terminated, truncated, infos = truncating_rollout[end + 1]
+        assert not terminated[env_index] and not truncated[env_index], (
+            "the autoreset transition belongs to neither episode and must carry no flags"
+        )
+        assert reward[env_index] == 0.0, "the autoreset transition must carry no reward"
+        assert infos["primitive_steps"][env_index] == 0, (
+            "the autoreset transition consumed no primitive steps, so it must cost the "
+            "budget nothing; a 1 here would let the option condition buy extra frames"
+        )
+        assert infos["_available"][env_index], (
+            "`available` must survive the autoreset, or the first decision of every "
+            "episode is taken under a mask of zeros"
+        )
 
 
 def test_observation_space_matches_encoder_assumptions() -> None:

@@ -5,7 +5,7 @@ families take a prefix. The digests fail if that order moves. Executor tests use
 `StubNetHack`: `NetHackChallenge.seed` raises, so the pinned env cannot be seeded.
 """
 
-from typing import Any, Dict, FrozenSet, List, Sequence, Tuple
+from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Tuple
 
 import gymnasium as gym
 import numpy as np
@@ -17,6 +17,7 @@ from options import (
     COMPASS,
     COMPASS_OFFSETS,
     CONCEDING_COMMANDS,
+    DETOUR_EPISODE_COST,
     GROUP_ARG,
     GROUP_DIR,
     GROUP_MOVE,
@@ -24,6 +25,11 @@ from options import (
     MISC_IN_YN,
     MOVE_REPEATS,
     NEEDS_WALKABLE,
+    TERM_BLOCKED,
+    TERM_DETOUR,
+    TERM_NO_HEADING,
+    TERM_NO_PROMPT,
+    TERM_SEQUENCE,
     OptionRow,
     OptionWrapper,
     _catalogue,
@@ -41,9 +47,9 @@ ENV_ID = "NetHackChallenge-v0"
 SHORT_EPISODE = 10
 """Legal horizon. No test here steps the env."""
 
-CATALOGUE_SIZE = 187
-GROUP_SIZES = {GROUP_MOVE: 40, GROUP_SINGLE: 15, GROUP_ARG: 100, GROUP_DIR: 32}
-CATALOGUE_DIGEST = "8fe16ff640adaf9f27f828c3fe49da85bdbd55b79600a689d2dcb133244c26a9"
+CATALOGUE_SIZE = 227
+GROUP_SIZES = {GROUP_MOVE: 80, GROUP_SINGLE: 15, GROUP_ARG: 100, GROUP_DIR: 32}
+CATALOGUE_DIGEST = "6106edb3543445855b3d36ef13b7cc6a170d95d9aa9000f4a19f37c7c3599f0a"
 
 GAMMA = 0.999
 INVENTORY_LENGTH = 55
@@ -61,6 +67,9 @@ CLOSED_DOOR_GLYPH = nethack.GLYPH_CMAP_OFF + 15
 OPEN_DOOR_GLYPH = nethack.GLYPH_CMAP_OFF + 13
 """cmap 19 lit room, 1 wall, 12 doorway, 15 closed door, 13 open. Named here: `options` does not export every cell."""
 
+MONSTER_GLYPH = nethack.GLYPH_MON_OFF + 1
+"""Not a cmap, so `_is_walkable` reads its cell as open however the hero fares against it."""
+
 DRAW_SIZE = 64
 """The n exp1, exp3 and exp4 use."""
 
@@ -75,31 +84,33 @@ KNOWN_TURN_ONE_ESCAPES = ("up",)
 the confirm is northwest (`y`). Reachable under `action`/`both` only.
 """
 
-GRAMMAR_DIGEST = "a7d03ca3459da7be266e123fbbc83e162ddebd2ed74a13a4a7de0eae63f6b11a"
-GRAMMAR_DEPTH_DIGEST = "48625a7b8afb9f197bff26c6d695a134a272f9c895cd30fb59f7da1088a28151"
+GRAMMAR_DIGEST = "c9c7555798bd30e9b50871a00916c2adeb948db22c57e6f75bb21d9cbae151bd"
+GRAMMAR_DEPTH_DIGEST = "b973f18cb5e90d675b5da2ef849493f1c48a91430f9d1d821719a8eae14c74f8"
 RANDOM_DIGESTS: Dict[int, str] = {
-    0: "a96e4638b5778939af2f72add147048475513b3877b256ed3d70e87dafaa77d4",
-    1: "6127d66260c50276aa2dc39e817bfb71eb9d7b4b9781eb05d77ad83a8513a763",
-    2: "4116ef05e1e9bdcc8ce38b868bc1db83f3df65fe35b3aaf5e6835bc891c8d9ec",
-    3: "c9fa83d3228a5b9883ec4c52dab6948cd3772b857eb9af02d067c058752a0ee2",
-    4: "b04c996cad5f6ceaf3096fc0280b7c40b87f869f3f39cf4cded7ff23fa58bd51",
+    0: "d5cf7e1ae76f9e4646be902e4a4b68acde6707f37a49a07878c351e14402b842",
+    1: "dd89951dc083f809e0a9a72c2404fb04e5bfe422cd612a1533d7381292c8b054",
+    2: "d2945b139d5f08956642a60cf122bf93496f69777d6e688786c93215eda7590d",
+    3: "83df4c8bfe670426ec347308d4542884b0fbbede35c012d318846056c14a5a1d",
+    4: "be5547d5d58b7ff7c5c8052f402dae6c7b48710f031c6a8975c26c508e65d830",
 }
 """The five option seeds exp3 draws."""
 
 GRAMMAR_PREFIX_AT_EIGHT = [
-    "move_N_x16",
+    "move_N_x16+follow",
     "down",
     "open_N",
-    "move_S_x16",
+    "move_S_x16+follow",
     "wait",
     "open_S",
-    "move_E_x16",
+    "move_E_x16+follow",
     "pickup",
 ]
-"""Spelled out rather than digested: the breadth-first prefix at n=8 is not movement-only."""
+"""Spelled out rather than digested: the breadth-first prefix at n=8 is not
+movement-only, and every movement row in it is the following twin."""
 
-FIRST_INTERACTION_DEPTH = 40
-"""`grammar_depth` rows before the first command. n at or below this is movement only."""
+FIRST_INTERACTION_DEPTH = 80
+"""`grammar_depth` rows before the first command: 40 following, then 40 directed.
+n at or below this is movement only."""
 
 
 @pytest.fixture(scope="module")
@@ -128,6 +139,9 @@ class StubNetHack(gym.Env):
     """Enough of NLE to drive the executor: a position, `misc`, and one map cell.
 
     `prompt_keys` raise a modal prompt held for `prompt_length` further keystrokes.
+    `obstacles` maps an absolute cell to the glyph drawn there, and the hero may
+    not enter one whatever that glyph reads as: that is how a monster stays
+    walkable to `I` and still stops the step, as it does in NetHack.
     """
 
     def __init__(
@@ -135,6 +149,8 @@ class StubNetHack(gym.Env):
         actions: Tuple[Any, ...],
         *,
         advance: bool = False,
+        walk: bool = False,
+        obstacles: Optional[Dict[Tuple[int, int], int]] = None,
         prompt_keys: FrozenSet[int] = frozenset(),
         prompt_length: int = 0,
         background_glyph: int = FLOOR_GLYPH,
@@ -144,6 +160,8 @@ class StubNetHack(gym.Env):
     ) -> None:
         self.actions = list(actions)
         self.advance = advance
+        self.walk = walk
+        self.obstacles = dict(obstacles or {})
         self.prompt_keys = prompt_keys
         self.prompt_length = prompt_length
         self.background_glyph = background_glyph
@@ -153,6 +171,10 @@ class StubNetHack(gym.Env):
         self.inv_letters = np.zeros(INVENTORY_LENGTH, dtype=np.uint8)
         self.keys: List[int] = []
         self.action_space = gym.spaces.Discrete(len(self.actions))
+        self.offset_of_key = {
+            self.actions.index(direction): COMPASS_OFFSETS[heading]
+            for heading, direction in enumerate(COMPASS)
+        }
         self._modal = 0
         self._x = START_X
         self._y = START_Y
@@ -163,6 +185,8 @@ class StubNetHack(gym.Env):
         glyphs = np.full(nethack.DUNGEON_SHAPE, self.background_glyph, dtype=np.int16)
         dx, dy = COMPASS_OFFSETS[self.neighbour_heading]
         glyphs[self._y + dy, self._x + dx] = self.neighbour_glyph
+        for (x, y), glyph in self.obstacles.items():
+            glyphs[y, x] = glyph
         blstats = np.zeros(nethack.NLE_BLSTATS_SIZE, dtype=np.int64)
         blstats[nethack.NLE_BL_X] = self._x
         blstats[nethack.NLE_BL_Y] = self._y
@@ -200,6 +224,11 @@ class StubNetHack(gym.Env):
             self.neighbour_glyph = OPEN_DOOR_GLYPH
         if self.advance:
             self._x += 1
+        elif self.walk and action in self.offset_of_key:
+            dx, dy = self.offset_of_key[action]
+            target = (self._x + dx, self._y + dy)
+            if target not in self.obstacles:
+                self._x, self._y = target
         self._time += 1
         return self._observation(), 0.0, False, False, {"end_status": 0}
 
@@ -474,6 +503,125 @@ def test_a_movement_row_that_keeps_moving_spends_its_reach(
     assert len(stub.keys) == reach
 
 
+def test_a_following_row_routes_around_a_wall_and_the_directed_twin_stops(
+    actions: Tuple[Any, ...],
+) -> None:
+    """The lever re-aim buys. Both rows meet the same wall on the same map: the
+    directed one pays a step to learn it is blocked, the following one steps past
+    and spends its whole reach on the heading."""
+    rows, names = option_table(actions)
+    reach = max(MOVE_REPEATS)
+    east = key_index(actions, nethack.CompassDirection.E)
+    wall = {(START_X + 1, START_Y): WALL_GLYPH}
+
+    directed_stub = StubNetHack(actions, walk=True, obstacles=wall)
+    directed_env = OptionWrapper(directed_stub, rows, gamma=GAMMA)
+    directed_env.reset()
+    _, _, _, _, directed = directed_env.step(names.index(f"move_E_x{reach}"))
+
+    following_stub = StubNetHack(actions, walk=True, obstacles=wall)
+    following_env = OptionWrapper(following_stub, rows, gamma=GAMMA)
+    following_env.reset()
+    _, _, _, _, following = following_env.step(
+        names.index(f"move_E_x{reach}+follow")
+    )
+
+    assert directed["primitive_steps"] == 1
+    assert directed["term_cause"] == TERM_BLOCKED
+    assert following["primitive_steps"] == reach + DETOUR_EPISODE_COST, (
+        "one detour off the heading, then the reach spent along it"
+    )
+    assert following["term_cause"] == TERM_SEQUENCE, (
+        "`reach` counts directed moves, so the detour did not eat the plan"
+    )
+    assert following_stub.keys[0] != east, "the first step leaves the blocked heading"
+    assert east in following_stub.keys[1:], "and the heading is resumed after it"
+
+
+def test_re_aim_takes_the_angularly_nearest_open_cell(
+    actions: Tuple[Any, ...],
+) -> None:
+    """Not a fixed ordering. `COMPASS` runs N, S, E, W, NE, NW, SE, SW, so any
+    positional fallback would reach N or S first, and both are 90 degrees off a
+    blocked easterly heading."""
+    rows, names = option_table(actions)
+    northeast = key_index(actions, nethack.CompassDirection.NE)
+    southeast = key_index(actions, nethack.CompassDirection.SE)
+    east_cell = (START_X + 1, START_Y)
+    northeast_cell = (START_X + 1, START_Y - 1)
+
+    open_diagonals = StubNetHack(actions, walk=True, obstacles={east_cell: WALL_GLYPH})
+    env = OptionWrapper(open_diagonals, rows, gamma=GAMMA)
+    env.reset()
+    env.step(names.index("move_E_x1+follow"))
+
+    walled_northeast = StubNetHack(
+        actions,
+        walk=True,
+        obstacles={east_cell: WALL_GLYPH, northeast_cell: WALL_GLYPH},
+    )
+    env = OptionWrapper(walled_northeast, rows, gamma=GAMMA)
+    env.reset()
+    env.step(names.index("move_E_x1+follow"))
+
+    assert open_diagonals.keys == [northeast], (
+        "NE and SE are both 45 degrees off east; the lower COMPASS index breaks it"
+    )
+    assert walled_northeast.keys == [southeast], (
+        "with NE walled the nearest open cell is SE, which sorts second to last"
+    )
+
+
+def test_a_following_row_in_a_sealed_cell_spends_no_keystroke(
+    actions: Tuple[Any, ...], rows: List[OptionRow]
+) -> None:
+    """Candidates are inspected, so with nothing open beta fires before `pi` pays
+    anything. Asserted on the row's own keystrokes first: the drain also charges
+    `primitive_steps`, so that reading is only sound once it is pinned at zero."""
+    entombed = StubNetHack(
+        actions, walk=True, background_glyph=WALL_GLYPH, neighbour_glyph=WALL_GLYPH
+    )
+    draw = [row for row in rows if row.name == f"move_E_x{max(MOVE_REPEATS)}+follow"]
+    env = OptionWrapper(entombed, draw, gamma=GAMMA)
+
+    observation, opening = env.reset()
+    assert not observation["misc"].any(), "a modal stub would drain and charge steps"
+    assert opening["initiation_empty"], "nothing is walkable, so `I` falls back"
+
+    _, _, _, _, sealed = env.step(0)
+    assert entombed.keys == [], "the row read the map and stepped nowhere"
+    assert sealed["drain_steps"] == 0
+    assert sealed["primitive_steps"] == 0
+    assert sealed["term_cause"] == TERM_NO_HEADING
+
+
+def test_the_detour_budget_bounds_a_row_blocked_by_a_walkable_looking_cell(
+    actions: Tuple[Any, ...],
+) -> None:
+    """A monster is not a cmap, so its glyph hides the terrain and both `I` and
+    re-aim read the cell as open. Re-aim never fires and the row keeps walking into
+    it; `detoured` is what ends that, short of the step limit."""
+    rows, names = option_table(actions)
+    reach = 4
+    east = key_index(actions, nethack.CompassDirection.E)
+    monster = StubNetHack(
+        actions, walk=True, obstacles={(START_X + 1, START_Y): MONSTER_GLYPH}
+    )
+    env = OptionWrapper(monster, rows, gamma=GAMMA)
+    _, opening = env.reset()
+    assert opening["available"][names.index(f"move_E_x{reach}")], (
+        "the monster's glyph hides the floor, so `I` cannot refuse the row"
+    )
+
+    _, _, _, _, spent = env.step(names.index(f"move_E_x{reach}+follow"))
+    assert monster.keys == [east] * reach, "every keystroke went at the heading"
+    assert spent["primitive_steps"] == reach, (
+        "the detour budget stopped it, not the step limit of "
+        f"{reach * (1 + DETOUR_EPISODE_COST)}"
+    )
+    assert spent["term_cause"] == TERM_DETOUR
+
+
 def test_initiation_reads_the_map_and_the_inventory(actions: Tuple[Any, ...]) -> None:
     """`I` offers a directional row only when the cell along its heading fits."""
     rows, names = option_table(actions)
@@ -517,6 +665,10 @@ def test_a_movement_row_needs_a_walkable_first_cell(actions: Tuple[Any, ...]) ->
         )
     assert walled["available"][names.index("move_S_x16")], "only north is walled"
     assert walled["available"][names.index("wait")], "SINGLE rows stay unconditional"
+    assert walled["available"][names.index("move_N_x16+follow")], (
+        "a following row needs somewhere to go rather than the heading cell, and "
+        "every other neighbour is open"
+    )
     assert 0.0 < walled["available_frac"] < 1.0
 
     stub.neighbour_glyph = FLOOR_GLYPH
@@ -579,18 +731,23 @@ def test_a_prompt_that_never_opens_suppresses_the_argument(
 
     _, _, _, _, info = env.step(names.index("open_N"))
     assert info["primitive_steps"] == 1, "beta fires rather than emitting the argument"
+    assert info["term_cause"] == TERM_NO_PROMPT
     assert stub.keys == [key_index(actions, nethack.Command.OPEN)]
 
 
 def test_every_row_carries_a_step_limit_and_the_movement_ladder(
     rows: List[OptionRow],
 ) -> None:
-    """`step_limit` is beta's bound, and on a movement row it is the reach ladder."""
+    """`step_limit` is beta's bound: the reach ladder directed, and the detour allowance on top of it following."""
     assert all(row.step_limit >= 1 for row in rows), "every row emits a keystroke"
     movement = [row for row in rows if row.group == GROUP_MOVE]
-    assert {row.step_limit for row in movement} == set(MOVE_REPEATS)
-    assert all(row.step_limit == row.reach for row in movement)
     assert all(row.heading in range(len(COMPASS)) for row in movement)
+    assert all(row.step_limit == row.reach for row in movement if not row.follow)
+    assert all(
+        row.step_limit == row.reach * (1 + DETOUR_EPISODE_COST)
+        for row in movement
+        if row.follow
+    ), "a following row is allowed one detour per unit of reach on top of the reach"
 
 
 def test_a_mask_with_nothing_in_it_offers_everything(

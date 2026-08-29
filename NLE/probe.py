@@ -11,7 +11,7 @@ import nle  # noqa: F401  registers NetHack envs with gymnasium
 import numpy as np
 
 from envs import make_env
-from options import make_options
+from options import NEEDS_NOTHING, make_options
 
 
 def main() -> None:
@@ -32,18 +32,18 @@ def main() -> None:
     args = parser.parse_args()
 
     raw = gym.make(args.env_id)
-    sequences, names, required_slots = make_options(
+    rows, _, _ = make_options(
         raw.unwrapped.actions,
         args.condition,
         args.n_options,
         args.option_family,
         args.option_seed,
     )
-    gated = sum(slot is not None for slot in required_slots)
+    gated = sum(row.requires != NEEDS_NOTHING for row in rows)
     print(f"n primitive actions: {raw.action_space.n}")
     print(
-        f"{len(sequences)} rows, {gated} gated on an inventory slot, "
-        f"mean length {np.mean([len(s) for s in sequences]):.2f}"
+        f"{len(rows)} rows, {gated} carrying a precondition, "
+        f"mean step limit {np.mean([row.step_limit for row in rows]):.2f}"
     )
     raw.close()
 
@@ -90,8 +90,8 @@ def main() -> None:
     print(f"available_frac:  {np.mean(available_fracs):.3f}")
     print(f"episodes:        {episodes}")
 
-    for name, sequence in zip(names, sequences):
-        print(f"{name}: {sequence}")
+    for row in rows:
+        print(f"{row.name}: {row.keystrokes} limit={row.step_limit} needs={row.requires}")
 
 
 if __name__ == "__main__":

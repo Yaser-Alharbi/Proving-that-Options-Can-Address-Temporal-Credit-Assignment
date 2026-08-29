@@ -8,14 +8,18 @@
 #   - the transition a NEXT_STEP autoreset inserts is excluded from the loss and
 #     from the diagnostics
 import csv
+import json
 import os
 import pathlib
 import random
+import socket
+import subprocess
 import time
 from dataclasses import dataclass
-from typing import Dict, Literal, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Tuple
 
 import gymnasium as gym
+import nle
 import numpy as np
 import torch
 import torch.nn as nn
@@ -26,7 +30,8 @@ from nle import nethack
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
 
-from envs import TASK_SUCCESSFUL, make_env
+from envs import STATUS_RUNNING, TASK_SUCCESSFUL, make_env
+from options import TERM_CAUSE_NAMES
 
 MASKED_LOGIT = -1e8
 """Logit given to an unavailable action. Large and negative rather than -inf, so
@@ -39,6 +44,49 @@ CHECKPOINT_EVERY_FRAMES = 500_000
 so the interval is comparable across conditions. Resume is not offered: NLE
 env state is not serialised, so a resumed run is not the continuation of a
 killed one."""
+
+LOG_SCHEMA_VERSION = 2
+"""Bump on any change to `EPISODE_COLUMNS` or to the trace shard arrays. Written
+to `provenance_seed{N}.json`, so a reader can tell which columns a directory
+predates without inferring it from the header."""
+
+BLSTATS_FIELDS = (
+    ("score", nethack.NLE_BL_SCORE),
+    ("dlvl", nethack.NLE_BL_DEPTH),
+    ("xp_level", nethack.NLE_BL_XP),
+    ("xp_points", nethack.NLE_BL_EXP),
+    ("gold", nethack.NLE_BL_GOLD),
+    ("hp", nethack.NLE_BL_HP),
+    ("hp_max", nethack.NLE_BL_HPMAX),
+    ("ac", nethack.NLE_BL_AC),
+    ("energy", nethack.NLE_BL_ENE),
+    ("hunger", nethack.NLE_BL_HUNGER),
+    ("time", nethack.NLE_BL_TIME),
+)
+"""Episode-record column name against its index into `blstats`."""
+
+BLSTATS_INDEX = dict(BLSTATS_FIELDS)
+
+BLSTATS_PEAK_FIELDS = ("score", "dlvl", "xp_level", "xp_points", "gold")
+"""Which of the above also get an episode maximum, as `max_{name}`. The fields
+that only rise, so that the terminal value is the whole story for the rest:
+`time` is monotone and already reported as `turns_survived`, while `hp`, `ac`
+and `hunger` fluctuate and their peaks describe nothing an episode did."""
+
+TRACE_BLSTATS_FIELDS = ("dlvl", "score", "hp", "time")
+"""Trace shard columns taken from the pre-step observation, so that they align
+with the value and logprob of the same row rather than with its outcome."""
+
+MAX_TRACKED_DLVL = 64
+"""Width of the per-episode depth-coverage mask, which `unique_dlvls` counts.
+NetHack's deepest level is in the fifties, so nothing reachable falls outside
+it; a depth that did would go uncounted rather than resize the mask."""
+
+XLOGFILE_FIELDS = ("role", "race", "gender", "align")
+"""What the episode record takes from NetHack's own log. `NetHackChallenge`
+passes `character="@"`, so these are drawn per episode and are not knowable
+from the run's arguments. The death reason is deliberately not taken from here;
+`terminal_message` comes from the observation, which exists either way."""
 
 IDENTITY_SENTINEL_STR = "-"
 IDENTITY_SENTINEL_INT = 0
@@ -76,6 +124,39 @@ EPISODE_COLUMNS = IDENTITY_COLUMNS + (
     # goal reward paid this episode
     "paid",
     "mean_option_duration",
+    # the game state at the last primitive with a turn on it, not at the
+    # terminal observation: NetHack zeroes blstats once the game is over
+    *(name for name, _ in BLSTATS_FIELDS),
+    *(f"max_{name}" for name in BLSTATS_PEAK_FIELDS),
+    "end_status",
+    "is_ascended",
+    "terminal_message",
+    # reward structure. The sums are of what the wrapper was handed, so under
+    # `clip_reward` they are sums of clipped primitives; `episodic_return` is
+    # the unclipped one, from a `RecordEpisodeStatistics` below the clip.
+    "steps_to_first_reward",
+    "n_nonzero_reward_steps",
+    "sum_positive_clipped",
+    "sum_negative_clipped",
+    "clipped_return",
+    # both discount conventions every episode, whichever one trained: the
+    # comparison between them is the point, and neither is recoverable from
+    # the other after the fact
+    "return_decision",
+    "return_primitive",
+    "decision_count",
+    "primitive_count",
+    "option_calls",
+    "fallback_frac",
+    # one JSON object per episode, keyed by the option id it invoked
+    "option_stats",
+    "unique_dlvls",
+    "turns_survived",
+    "env_seed",
+    *XLOGFILE_FIELDS,
+    "wall_clock",
+    "host",
+    "sps",
 )
 
 ENCODER_OBS_DTYPE = {
@@ -85,10 +166,7 @@ ENCODER_OBS_DTYPE = {
     # and gold cannot reach at these budgets.
     "blstats": torch.float32,
 }
-"""What the network reads, and the storage dtype for each. The env emits more
-keys than this — the option wrapper needs `inv_letters` to decide `available` —
-and the rollout buffer holds only these, so it does not grow with the wrapper's
-needs. Shapes still come from the observation space."""
+"""Network keys. Wrapper also needs `inv_letters`/map for `I` and `misc` for the drain."""
 
 
 @dataclass
@@ -116,6 +194,14 @@ class Args:
     defaults to 1e6, at which one episode can consume a whole run."""
     clip_reward: bool = True
     """clip reward to [-1, 1] per primitive step, before any option sums it"""
+    log_trace: bool = True
+    """write one compressed shard per update to `decisions_seed{N}/`. One row per
+    env per `envs.step`, so the grain is decisions, not primitive steps: value
+    and logprob only exist where the policy acted."""
+    checkpoint_keep: Literal["all", "endpoints"] = "endpoints"
+    """`endpoints` writes the first checkpoint, the first at half the budget and
+    the last, which is three files a seed. `all` writes every cadence hit and is
+    for one representative cell: a full sweep of them does not fit the quota."""
     directory: str = ""
     """cell directory written by main.py. Empty: a standalone run under results/"""
     tag: str = ""
@@ -202,6 +288,47 @@ def cell_identity(args: Args) -> Dict[str, object]:
         "executor": IDENTITY_SENTINEL_STR,
         "tag": args.tag,
     }
+
+
+def git_sha() -> Optional[str]:
+    """The repository's HEAD, or None if git cannot answer."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=pathlib.Path(__file__).resolve().parent,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except OSError:
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def read_xlogfile(path: pathlib.Path, offset: int) -> Tuple[Dict[str, str], int]:
+    """The newest complete record past `offset`, and the offset after it.
+
+    NetHack appends one tab-separated `key=value` line per finished game. It
+    writes nothing for an episode gymnasium's `TimeLimit` truncated, because
+    that game is still running, so a caller that reads unconditionally would
+    attribute some earlier episode's character to it. Reading from `offset`
+    makes that visible as an empty record rather than as a plausible one.
+    """
+    with open(path, "rb") as handle:
+        handle.seek(offset)
+        new = handle.read()
+    cut = new.rfind(b"\n")
+    if cut < 0:
+        return {}, offset
+    lines = [line for line in new[:cut].split(b"\n") if line]
+    if not lines:
+        return {}, offset + cut + 1
+    record = dict(
+        field.split("=", 1)
+        for field in lines[-1].decode("ascii", "replace").split("\t")
+        if "=" in field
+    )
+    return record, offset + cut + 1
 
 
 def save_checkpoint(
@@ -453,7 +580,30 @@ if __name__ == "__main__":
     csv_writer = csv.DictWriter(csv_file, fieldnames=list(EPISODE_COLUMNS))
     if csv_path.stat().st_size == 0:
         csv_writer.writeheader()
-    checkpoint_path = run_dir / f"checkpoint_seed{args.seed}.pt"
+    episode_rows: List[Dict[str, object]] = []
+    """Finished episodes since the last flush. Written per update rather than
+    per episode: at NLE episode rates a flush per episode is a syscall on a
+    shared filesystem inside the rollout."""
+
+    host = socket.gethostname()
+    # unconditional, and not named meta.json: main.py's finish_cell owns that
+    # name and only reaches it when every seed of the cell succeeded, which
+    # leaves a partially-failed group with no provenance at all
+    (run_dir / f"provenance_seed{args.seed}.json").write_text(
+        json.dumps(
+            {
+                "git_sha": git_sha(),
+                "nle_version": nle.__version__,
+                "host": host,
+                "log_schema_version": LOG_SCHEMA_VERSION,
+            },
+            indent=2,
+        )
+    )
+
+    trace_dir = run_dir / f"decisions_seed{args.seed}"
+    if args.log_trace:
+        trace_dir.mkdir(parents=True, exist_ok=True)
 
     # TRY NOT TO MODIFY: seeding
     random.seed(args.seed)
@@ -508,9 +658,55 @@ if __name__ == "__main__":
     rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
     discounts = torch.zeros((args.num_steps, args.num_envs)).to(device)
     primitive_steps = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    drain_steps = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    fallbacks = torch.zeros((args.num_steps, args.num_envs)).to(device)
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
     values = torch.zeros((args.num_steps, args.num_envs)).to(device)
     available = torch.zeros((args.num_steps, args.num_envs, num_actions), dtype=torch.bool, device=device)
+
+    # per-episode accumulation, one lane per env, all of it numpy over the batch
+    ep_return_decision = np.zeros(args.num_envs, dtype=np.float64)
+    ep_return_primitive = np.zeros(args.num_envs, dtype=np.float64)
+    ep_clipped_return = np.zeros(args.num_envs, dtype=np.float64)
+    ep_sum_positive = np.zeros(args.num_envs, dtype=np.float64)
+    ep_sum_negative = np.zeros(args.num_envs, dtype=np.float64)
+    ep_nonzero_steps = np.zeros(args.num_envs, dtype=np.int64)
+    ep_steps_to_first = np.full(args.num_envs, -1, dtype=np.int64)
+    ep_decision_count = np.zeros(args.num_envs, dtype=np.int64)
+    ep_primitive_count = np.zeros(args.num_envs, dtype=np.int64)
+    ep_option_calls = np.zeros(args.num_envs, dtype=np.int64)
+    ep_fallbacks = np.zeros(args.num_envs, dtype=np.int64)
+    ep_peak_blstats = np.zeros(
+        (args.num_envs,) + envs.single_observation_space["blstats"].shape, dtype=np.int64
+    )
+    ep_dlvl_seen = np.zeros((args.num_envs, MAX_TRACKED_DLVL), dtype=bool)
+    ep_option_n = np.zeros((args.num_envs, num_actions), dtype=np.int64)
+    ep_option_steps = np.zeros((args.num_envs, num_actions), dtype=np.int64)
+    ep_option_peak = np.zeros((args.num_envs, num_actions), dtype=np.int64)
+    ep_option_cause = np.zeros((args.num_envs, num_actions, len(TERM_CAUSE_NAMES)), dtype=np.int64)
+
+    # `option_calls` is the tail of the table, because `make_options` emits the
+    # primitives first and the chosen rows after them
+    if args.condition == "action":
+        n_primitives = num_actions
+    elif args.condition == "option":
+        n_primitives = 0
+    else:
+        n_primitives = num_actions - args.n_options
+
+    # private, and the only handle on it: NLE gives each `Nethack` its own
+    # `tempfile.TemporaryDirectory`, so these are distinct and their last lines
+    # cannot interleave. Asserted rather than assumed, because two envs sharing
+    # one would attribute the wrong character to the wrong lane in silence.
+    xlog_paths = [pathlib.Path(env.unwrapped.nethack._vardir) / "xlogfile" for env in envs.envs]
+    assert len(set(xlog_paths)) == args.num_envs, f"envs share an xlogfile: {xlog_paths}"
+    xlog_offsets = [0] * args.num_envs
+
+    trace_global_step = np.zeros((args.num_steps, args.num_envs), dtype=np.int32)
+    trace_undiscounted = np.zeros((args.num_steps, args.num_envs), dtype=np.float32)
+    trace_cause = np.zeros((args.num_steps, args.num_envs), dtype=np.int32)
+    trace_env_id = np.tile(np.arange(args.num_envs, dtype=np.int32), args.num_steps)
+    trace_blstats_indices = [BLSTATS_INDEX[name] for name in TRACE_BLSTATS_FIELDS]
 
     def to_device(observation: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:
         """Move the encoder's observation keys onto the device, dropping the rest."""
@@ -525,12 +721,16 @@ if __name__ == "__main__":
     iteration = 0
     updates = 0
     last_checkpoint_frames = 0
+    wrote_first_checkpoint = False
+    wrote_midpoint_checkpoint = False
     start_time = time.time()
     next_obs_np, next_infos = envs.reset(seed=args.seed)
     next_obs = to_device(next_obs_np)
     assert next_infos["_available"].all(), "the env must emit `available` from reset"
     next_available = torch.as_tensor(next_infos["available"], dtype=torch.bool, device=device)
+    next_fallback_np = np.asarray(next_infos["initiation_empty"], dtype=bool)
     next_done = torch.zeros(args.num_envs).to(device)
+    next_done_np = np.zeros(args.num_envs, dtype=bool)
 
     while frames < args.budget:
         iteration += 1
@@ -547,6 +747,9 @@ if __name__ == "__main__":
                 buffer[step] = next_obs[key]
             dones[step] = next_done
             available[step] = next_available
+            fallbacks[step] = torch.as_tensor(
+                next_fallback_np, dtype=torch.float32, device=device
+            )
 
             # ALGO LOGIC: action logic
             with torch.no_grad():
@@ -555,8 +758,16 @@ if __name__ == "__main__":
             actions[step] = action
             logprobs[step] = logprob
 
+            # the transition a NEXT_STEP autoreset inserts is the one whose
+            # predecessor was done, so it is read here, before the step
+            # overwrites the flag. It belongs to no episode.
+            live = np.logical_not(next_done_np)
+            # previous-step flag: the mask this action was sampled under
+            chose_on_fallback = next_fallback_np
+
             # TRY NOT TO MODIFY: execute the game and log data.
-            next_obs_np, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
+            action_np = action.cpu().numpy()
+            next_obs_np, reward, terminations, truncations, infos = envs.step(action_np)
             next_done_np = np.logical_or(terminations, truncations)
             rewards[step] = torch.as_tensor(reward, dtype=torch.float32, device=device).view(-1)
 
@@ -567,6 +778,10 @@ if __name__ == "__main__":
             frames += int(steps_taken.sum())
             decisions += args.num_envs
             primitive_steps[step] = torch.as_tensor(steps_taken, dtype=torch.float32, device=device)
+            assert infos["_drain_steps"].all(), "the env must emit `drain_steps` every step"
+            drain_steps[step] = torch.as_tensor(
+                infos["drain_steps"], dtype=torch.float32, device=device
+            )
 
             if args.discount == "primitive":
                 discounts[step] = torch.as_tensor(
@@ -577,8 +792,63 @@ if __name__ == "__main__":
 
             assert infos["_available"].all(), "the env must emit `available` every step"
             next_available = torch.as_tensor(infos["available"], dtype=torch.bool, device=device)
+            assert infos["_initiation_empty"].all(), (
+                "the env must emit `initiation_empty` every step"
+            )
+            next_fallback_np = np.asarray(infos["initiation_empty"], dtype=bool)
             next_obs = to_device(next_obs_np)
             next_done = torch.as_tensor(next_done_np, dtype=torch.float32, device=device)
+
+            # episode accumulation, vectorised over the batch and masked to the
+            # live lanes. The wrapper's reward is discounted within the option,
+            # which is what the primitive clock wants; the decision clock needs
+            # the undiscounted sum, so one convention cannot be derived from the
+            # other here and both are carried.
+            undiscounted = infos["undiscounted_reward"]
+            ingame_blstats = infos["ingame_blstats"]
+            term_cause = infos["term_cause"]
+            ep_return_primitive += live * args.gamma**ep_primitive_count * reward
+            ep_return_decision += live * args.gamma**ep_decision_count * undiscounted
+            ep_clipped_return += live * undiscounted
+            ep_sum_positive += live * infos["sum_positive_clipped"]
+            ep_sum_negative += live * infos["sum_negative_clipped"]
+            ep_nonzero_steps += live * infos["nonzero_reward_steps"]
+
+            # the wrapper's offset is inside the decision, so it only becomes an
+            # episode index once the primitives before this decision are added.
+            # Written once and then frozen, so a later rewarding decision cannot
+            # move it.
+            first_offset = infos["first_reward_offset"]
+            first_hit = live & (ep_steps_to_first < 0) & (first_offset >= 0)
+            ep_steps_to_first[first_hit] = ep_primitive_count[first_hit] + first_offset[first_hit]
+
+            ep_decision_count += live
+            ep_primitive_count += live * steps_taken
+            ep_option_calls += live & (action_np >= n_primitives)
+            ep_fallbacks += live & chose_on_fallback
+            np.maximum(ep_peak_blstats, ingame_blstats, out=ep_peak_blstats, where=live[:, None])
+
+            live_rows = np.flatnonzero(live)
+            live_ids = action_np[live_rows]
+            # `TERM_NONE` is -1 and would wrap
+            assert (term_cause[live_rows] >= 0).all(), "a live decision reported no cause"
+            # the row indices are distinct, so these are scatters rather than
+            # read-modify-writes and need no `np.add.at`
+            ep_option_n[live_rows, live_ids] += 1
+            ep_option_steps[live_rows, live_ids] += steps_taken[live_rows]
+            ep_option_peak[live_rows, live_ids] = np.maximum(
+                ep_option_peak[live_rows, live_ids], steps_taken[live_rows]
+            )
+            ep_option_cause[live_rows, live_ids, term_cause[live_rows]] += 1
+
+            depth = ingame_blstats[:, nethack.NLE_BL_DEPTH]
+            seen = live & (depth >= 0) & (depth < MAX_TRACKED_DLVL)
+            ep_dlvl_seen[np.flatnonzero(seen), depth[seen]] = True
+
+            if args.log_trace:
+                trace_global_step[step] = frames
+                trace_undiscounted[step] = undiscounted
+                trace_cause[step] = term_cause
 
             if "episode" in infos:
                 finished = infos["_episode"]
@@ -589,9 +859,8 @@ if __name__ == "__main__":
                     print(f"frames={frames}, episodic_return={episodic_return}")
                     writer.add_scalar("charts/episodic_return", episodic_return, frames)
                     writer.add_scalar("charts/episodic_length", episodic_length, frames)
-                    solved = int(
-                        int(infos["end_status"][env_index]) == TASK_SUCCESSFUL
-                    )
+                    end_status = int(infos["end_status"][env_index])
+                    solved = int(end_status == TASK_SUCCESSFUL)
                     # if no `paid`, use `solved`
              
                     paid_mask = infos.get("_paid")
@@ -600,7 +869,47 @@ if __name__ == "__main__":
                         if paid_mask is not None and paid_mask[env_index]
                         else solved
                     )
-                    csv_writer.writerow(
+                    # only where the game itself ended: a gymnasium truncation
+                    # leaves it running and unrecorded, and reading anyway would
+                    # take some earlier episode's record for this one
+                    character = dict.fromkeys(XLOGFILE_FIELDS, "")
+                    if end_status != STATUS_RUNNING:
+                        record, xlog_offsets[env_index] = read_xlogfile(
+                            xlog_paths[env_index], xlog_offsets[env_index]
+                        )
+                        character.update(
+                            {field: record.get(field, "") for field in XLOGFILE_FIELDS}
+                        )
+
+                    peak_frame = ep_peak_blstats[env_index]
+                    last_frame = ingame_blstats[env_index]
+                    # printable only: the message line carries whatever the agent
+                    # typed into a prompt, and one control byte in a CSV field is
+                    # a new row to half the readers that will open this
+                    message = (
+                        bytes(infos["ingame_message"][env_index])
+                        .split(b"\0")[0]
+                        .decode("ascii", "replace")
+                    )
+                    terminal_message = "".join(c for c in message if c.isprintable()).strip()
+                    invoked = np.flatnonzero(ep_option_n[env_index])
+                    option_stats = {
+                        int(option_id): {
+                            "n": int(ep_option_n[env_index, option_id]),
+                            "mean_duration": round(
+                                float(ep_option_steps[env_index, option_id])
+                                / float(ep_option_n[env_index, option_id]),
+                                3,
+                            ),
+                            "max_duration": int(ep_option_peak[env_index, option_id]),
+                            **{
+                                name: int(ep_option_cause[env_index, option_id, cause_index])
+                                for cause_index, name in enumerate(TERM_CAUSE_NAMES)
+                            },
+                        }
+                        for option_id in invoked
+                    }
+                    episode_rows.append(
                         {
                             **identity,
                             "seed": args.seed,
@@ -612,9 +921,81 @@ if __name__ == "__main__":
                             "solved": solved,
                             "paid": paid,
                             "mean_option_duration": episodic_length / max(episode_decisions, 1),
+                            **{name: int(last_frame[index]) for name, index in BLSTATS_FIELDS},
+                            **{
+                                f"max_{name}": int(peak_frame[BLSTATS_INDEX[name]])
+                                for name in BLSTATS_PEAK_FIELDS
+                            },
+                            "end_status": end_status,
+                            "is_ascended": int(infos["is_ascended"][env_index]),
+                            "terminal_message": terminal_message,
+                            "steps_to_first_reward": int(ep_steps_to_first[env_index]),
+                            "n_nonzero_reward_steps": int(ep_nonzero_steps[env_index]),
+                            "sum_positive_clipped": float(ep_sum_positive[env_index]),
+                            "sum_negative_clipped": float(ep_sum_negative[env_index]),
+                            "clipped_return": float(ep_clipped_return[env_index]),
+                            "return_decision": float(ep_return_decision[env_index]),
+                            "return_primitive": float(ep_return_primitive[env_index]),
+                            "decision_count": int(ep_decision_count[env_index]),
+                            "primitive_count": int(ep_primitive_count[env_index]),
+                            "option_calls": int(ep_option_calls[env_index]),
+                            "fallback_frac": (
+                                float(ep_fallbacks[env_index])
+                                / max(int(ep_decision_count[env_index]), 1)
+                            ),
+                            "option_stats": json.dumps(option_stats, separators=(",", ":")),
+                            "unique_dlvls": int(ep_dlvl_seen[env_index].sum()),
+                            "turns_survived": int(last_frame[nethack.NLE_BL_TIME]),
+                            "env_seed": args.seed + env_index,
+                            **character,
+                            "wall_clock": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                            "host": host,
+                            "sps": int(frames / max(time.time() - start_time, 1e-9)),
                         }
                     )
-                    csv_file.flush()
+
+                    ep_return_decision[env_index] = 0.0
+                    ep_return_primitive[env_index] = 0.0
+                    ep_clipped_return[env_index] = 0.0
+                    ep_sum_positive[env_index] = 0.0
+                    ep_sum_negative[env_index] = 0.0
+                    ep_nonzero_steps[env_index] = 0
+                    ep_steps_to_first[env_index] = -1
+                    ep_decision_count[env_index] = 0
+                    ep_primitive_count[env_index] = 0
+                    ep_option_calls[env_index] = 0
+                    ep_fallbacks[env_index] = 0
+                    ep_peak_blstats[env_index] = 0
+                    ep_dlvl_seen[env_index] = False
+                    ep_option_n[env_index] = 0
+                    ep_option_steps[env_index] = 0
+                    ep_option_peak[env_index] = 0
+                    ep_option_cause[env_index] = 0
+
+        if episode_rows:
+            csv_writer.writerows(episode_rows)
+            csv_file.flush()
+            episode_rows.clear()
+
+        if args.log_trace:
+            trace_blstats = obs["blstats"][:, :, trace_blstats_indices].cpu().numpy()
+            np.savez_compressed(
+                trace_dir / f"f{frames:09d}.npz",
+                global_step=trace_global_step.reshape(-1),
+                env_id=trace_env_id,
+                reward=rewards.cpu().numpy().reshape(-1).astype(np.float32),
+                undiscounted_reward=trace_undiscounted.reshape(-1),
+                action=actions.cpu().numpy().reshape(-1).astype(np.int32),
+                primitive_steps=primitive_steps.cpu().numpy().reshape(-1).astype(np.int32),
+                term_cause=trace_cause.reshape(-1),
+                done=dones.cpu().numpy().reshape(-1).astype(np.int32),
+                value=values.cpu().numpy().reshape(-1).astype(np.float32),
+                logprob=logprobs.cpu().numpy().reshape(-1).astype(np.float32),
+                **{
+                    name: trace_blstats[:, :, column].reshape(-1).astype(np.int32)
+                    for column, name in enumerate(TRACE_BLSTATS_FIELDS)
+                },
+            )
 
         # bootstrap value if not done
         with torch.no_grad():
@@ -743,6 +1124,16 @@ if __name__ == "__main__":
             .item(),
             frames,
         )
+        # inherited a modal state and drained it
+        writer.add_scalar(
+            "option/drain_frac", masked_mean((drain_steps > 0).float(), live).item(), frames
+        )
+        writer.add_scalar(
+            "option/drain_steps_mean", masked_mean(drain_steps, live).item(), frames
+        )
+        writer.add_scalar(
+            "option/fallback_frac", masked_mean(fallbacks, live).item(), frames
+        )
         available_live = b_available[live_rows.reshape(-1)]
         if available_live.numel() > 0:
             n_available = available_live.sum(-1).float()
@@ -767,13 +1158,38 @@ if __name__ == "__main__":
         writer.add_scalar("iter/grad_norm_max", float(np.max(grad_norms)), frames)
 
         if frames - last_checkpoint_frames >= CHECKPOINT_EVERY_FRAMES:
-            save_checkpoint(
-                checkpoint_path, agent, optimizer, frames, decisions, iteration, updates, args
-            )
             last_checkpoint_frames = frames
+            past_midpoint = frames >= args.budget // 2
+            if (
+                args.checkpoint_keep == "all"
+                or not wrote_first_checkpoint
+                or (past_midpoint and not wrote_midpoint_checkpoint)
+            ):
+                save_checkpoint(
+                    run_dir / f"checkpoint_seed{args.seed}_f{frames:09d}.pt",
+                    agent,
+                    optimizer,
+                    frames,
+                    decisions,
+                    iteration,
+                    updates,
+                    args,
+                )
+                wrote_first_checkpoint = True
+                wrote_midpoint_checkpoint = wrote_midpoint_checkpoint or past_midpoint
 
+    if episode_rows:
+        csv_writer.writerows(episode_rows)
+        csv_file.flush()
     save_checkpoint(
-        checkpoint_path, agent, optimizer, frames, decisions, iteration, updates, args
+        run_dir / f"checkpoint_seed{args.seed}_f{frames:09d}.pt",
+        agent,
+        optimizer,
+        frames,
+        decisions,
+        iteration,
+        updates,
+        args,
     )
     envs.close()
     writer.close()

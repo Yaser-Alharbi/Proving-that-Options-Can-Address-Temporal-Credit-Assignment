@@ -2,13 +2,14 @@ from typing import Callable, Literal
 
 import gymnasium as gym
 import nle  # noqa: F401  registers NetHack envs with gymnasium
+from nle.env.base import NLE
 from nle.env.tasks import NetHackStaircase
 
 from delayed import DELAYED_ENVS
 from options import OptionWrapper, make_options
 
-OBSERVATION_KEYS = ("glyphs", "blstats", "inv_letters")
-"""Wider than the encoder consumes: `inv_letters` decides the initiation sets."""
+OBSERVATION_KEYS = ("glyphs", "blstats", "inv_letters", "misc", "message")
+"""Wider than the encoder: map/`inv_letters` for `I`, `misc` for the drain."""
 
 REWARD_CLIP = 1.0
 
@@ -17,6 +18,13 @@ TASK_SUCCESSFUL = int(NetHackStaircase.StepStatus.TASK_SUCCESSFUL)
 column records. Read off the task class rather than written as a literal: base
 NLE's `StepStatus` has no such member, so the number only exists on the goal
 tasks, and the delayed envs inherit this enum."""
+
+STATUS_RUNNING = int(NLE.StepStatus.RUNNING)
+"""`end_status` on an episode the game itself did not end. `gymnasium.make`
+takes `max_episode_steps` for a `TimeLimit` of its own, so a truncated
+`NetHackChallenge` episode arrives with the game still in progress and NetHack
+has written no xlogfile record for it. The episode log reads the character off
+that record, so it must know the difference."""
 
 
 def make_nle(env_id: str, max_episode_steps: int, reward_delay: int = 0) -> gym.Env:
@@ -73,10 +81,10 @@ def make_env(
             # would be a different transformation for a 16-step option than for
             # a primitive.
             env = gym.wrappers.ClipReward(env, -REWARD_CLIP, REWARD_CLIP)
-        sequences, _, required_slots = make_options(
+        rows, _, _ = make_options(
             env.unwrapped.actions, condition, n_options, option_family, option_seed
         )
-        env = OptionWrapper(env, sequences, required_slots, gamma=gamma)
+        env = OptionWrapper(env, rows, gamma=gamma)
         env.reset(seed=seed + idx)
         return env
 

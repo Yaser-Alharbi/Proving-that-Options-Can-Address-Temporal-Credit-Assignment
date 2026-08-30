@@ -412,6 +412,37 @@ def select(cells: Sequence[Cell], names: Optional[Sequence[str]]) -> List[Cell]:
     return [cell for cell in cells if cell.name in names]
 
 
+CONDITION_LAUNCH_RANK: Dict[Condition, int] = {"option": 0, "action": 1, "both": 2}
+"""Interleave order inside one seed, not the order any figure reads."""
+
+
+def order_jobs(jobs: Sequence[Job]) -> List[Job]:
+    """`jobs` seed-major, with the conditions interleaved inside each seed.
+
+    Queues all conditions at one seed before moving to the next; interleaves conditions per seed.
+    """
+    by_axes = sorted(
+        jobs,
+        key=lambda job: (
+            job.seed,
+            job.cell.args.n_options,
+            job.cell.args.reward_delay,
+            job.cell.args.discount,
+            job.cell.args.option_family,
+            job.cell.args.option_seed,
+        ),
+    )
+    taken: Dict[Tuple[int, Condition], int] = {}
+    keyed: List[Tuple[Tuple[int, int, int], Job]] = []
+    for job in by_axes:
+        condition = job.cell.args.condition
+        position = taken.get((job.seed, condition), 0)
+        taken[(job.seed, condition)] = position + 1
+        keyed.append(((job.seed, position, CONDITION_LAUNCH_RANK[condition]), job))
+    keyed.sort(key=lambda entry: entry[0])
+    return [job for _, job in keyed]
+
+
 def resolve_gpus(requested: Optional[str]) -> List[int]:
     """The device indices to pin to, defaulting to every device torch sees."""
     import torch
@@ -781,7 +812,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     assert_gpu(gpus)
     preflight(cells)
 
-    jobs = [Job(cell, seed) for cell in cells for seed in cell.seeds]
+    jobs = order_jobs([Job(cell, seed) for cell in cells for seed in cell.seeds])
     if options.seeds < len(ANALYSIS_SEEDS):
         print(
             f"\nPILOT: {options.seeds} seeds is below plot.py's MIN_SEEDS_FOR_IQM, "

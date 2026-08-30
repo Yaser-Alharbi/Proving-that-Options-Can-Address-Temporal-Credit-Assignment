@@ -1,9 +1,9 @@
-"""Tests for the exp4 reward delay.
+"""Tests for the exp4 reward delay."""
 
-The predicate and the reward function are called against a hand-constructed
-observation. One test rolls out, to pin where NLE's internal horizon reports itself.
-"""
-
+import csv
+import pathlib
+import subprocess
+import sys
 from typing import TYPE_CHECKING, Any, Tuple
 
 import gymnasium as gym
@@ -18,15 +18,37 @@ from options import _catalogue, catalogue_digest
 if TYPE_CHECKING:
     from _pytest.monkeypatch import MonkeyPatch
 
+HERE = pathlib.Path(__file__).resolve().parent.parent
+
 DELAYED_STAIRCASE = "DelayedStaircase-v0"
 HORIZON = 40
-"""Long enough for NLE start-up menus, short enough to reach."""
+"""Covers NLE start-up menus; still reaches the horizon."""
+
+FORCE_SOLVED = """
+import runpy
+import torch
+
+torch.set_num_threads(1)
+from nle.env.tasks import NetHackStaircase
+
+NetHackStaircase._is_episode_end = (
+    lambda self, observation: self.StepStatus.TASK_SUCCESSFUL
+)
+runpy.run_path("ppo.py", run_name="__main__")
+"""
+"""`ppo.py` under `__main__` with the goal always firing."""
+
+CSV_RUN_SEED = 3
+CSV_RUN_ENVS = 2
+CSV_RUN_STEPS = 16
+CSV_RUN_BUDGET = 128
+"""One forced-solve run."""
 
 STAIRS_DOWN = 4
-"""Index of the stairs_down flag in `internal`. What `NetHackStaircase._is_episode_end` reads."""
+"""Index of the stairs_down flag in `internal`."""
 
-FROZEN_STEP_PENALTY = -0.01
-"""`NetHackScore.penalty_step`. These tests reuse one observation, so time never advances."""
+NO_REWARD = 0.0
+"""Reward of a step that does not flush the bank."""
 
 GOAL_REWARD = 1.0
 
@@ -62,7 +84,7 @@ def statuses_until_terminal(env: Any, observation: Any, limit: int) -> list:
 
 @pytest.mark.parametrize("reward_delay", [0, 1, 4, 16])
 def test_the_goal_is_held_for_exactly_reward_delay_steps(reward_delay: int) -> None:
-    """The task ends `reward_delay` primitive steps after it was first solved. Delay 0 is NLE's own task."""
+    """The task ends `reward_delay` steps after first solved."""
     env = delayed_env(reward_delay)
     statuses = statuses_until_terminal(env, solved_observation(env), reward_delay + 2)
     env.close()
@@ -85,11 +107,20 @@ def test_an_unsolved_observation_never_latches() -> None:
     env.close()
 
     assert all(status == env.StepStatus.RUNNING for status in statuses)
-    assert banked == pytest.approx(FROZEN_STEP_PENALTY)
+    assert banked == pytest.approx(NO_REWARD)
+
+
+def test_a_delayed_host_charges_no_per_step_penalty() -> None:
+    """The goal reward is the only nonzero reward."""
+    env = delayed_env(reward_delay=0)
+    penalty_step = env.penalty_step
+    env.close()
+
+    assert penalty_step == 0.0
 
 
 def test_nothing_is_paid_during_the_hold() -> None:
-    """Held steps carry the time penalty only. The goal reward arrives once, or return would scale with delay."""
+    """Held steps earn nothing; the goal reward arrives once."""
     reward_delay = 5
     env = delayed_env(reward_delay)
     observation = solved_observation(env)
@@ -103,13 +134,13 @@ def test_nothing_is_paid_during_the_hold() -> None:
     env.close()
 
     assert final_status == env.StepStatus.TASK_SUCCESSFUL
-    assert held == pytest.approx([FROZEN_STEP_PENALTY] * reward_delay)
-    assert paid == pytest.approx(FROZEN_STEP_PENALTY + GOAL_REWARD)
+    assert held == pytest.approx([NO_REWARD] * reward_delay)
+    assert paid == pytest.approx(GOAL_REWARD)
 
 
 @pytest.mark.parametrize("end_status", ["ABORTED", "DEATH"])
 def test_a_terminal_step_inside_the_hold_still_pays(end_status: str) -> None:
-    """Horizon and death inside the hold both flush the bank. Without that, a long delay silently cuts the return."""
+    """Horizon and death inside the hold flush the bank."""
     env = delayed_env(reward_delay=1000)
     observation = solved_observation(env)
     env._is_episode_end(observation)
@@ -118,11 +149,11 @@ def test_a_terminal_step_inside_the_hold_still_pays(end_status: str) -> None:
     )
     env.close()
 
-    assert paid == pytest.approx(FROZEN_STEP_PENALTY + GOAL_REWARD)
+    assert paid == pytest.approx(GOAL_REWARD)
 
 
 def test_reset_clears_the_latch() -> None:
-    """The next episode does not inherit the last one's hold or payout flag."""
+    """Reset clears the hold and the payout flag."""
     env = delayed_env(reward_delay=8)
     env._is_episode_end(solved_observation(env))
     env._reward_fn(
@@ -138,11 +169,11 @@ def test_reset_clears_the_latch() -> None:
         env.last_observation, 0, env.last_observation, env.StepStatus.ABORTED
     )
     env.close()
-    assert unpaid == pytest.approx(FROZEN_STEP_PENALTY)
+    assert unpaid == pytest.approx(NO_REWARD)
 
 
 def test_the_internal_horizon_terminates_rather_than_truncates() -> None:
-    """NLE's own step limit arrives as `terminated` with end_status ABORTED. `terminated` is also death and the goal."""
+    """NLE's step limit arrives as `terminated` with ABORTED."""
     env = delayed_env(reward_delay=8, horizon=HORIZON)
     for step in range(HORIZON):
         _, _, terminated, truncated, info = env.step(0)
@@ -156,7 +187,7 @@ def test_the_internal_horizon_terminates_rather_than_truncates() -> None:
 
 
 def always_solved(self: Any, observation: Any) -> int:
-    """Goal predicate that fires every step, so the latch is reachable without walking to a staircase."""
+    """Goal predicate that fires every step."""
     del observation
     return self.StepStatus.TASK_SUCCESSFUL
 
@@ -164,7 +195,7 @@ def always_solved(self: Any, observation: Any) -> int:
 def test_a_horizon_flush_reports_paid_without_reporting_success(
     monkeypatch: "MonkeyPatch",
 ) -> None:
-    """A hold outliving the horizon pays the bank and still ends ABORTED. Through `env.step`: `_reward_fn` never fills info."""
+    """A hold that outlives the horizon pays and still ends ABORTED."""
     monkeypatch.setattr(NetHackStaircase, "_is_episode_end", always_solved)
     env = delayed_env(reward_delay=HORIZON * 2)
 
@@ -183,7 +214,7 @@ def test_a_horizon_flush_reports_paid_without_reporting_success(
 def test_a_flushed_episode_logs_paid_without_logging_solved(
     monkeypatch: "MonkeyPatch",
 ) -> None:
-    """The trainer writes `paid=1`, `solved=0` for a flush. Through the vector env, so `_paid` is `_add_info`'s mask."""
+    """Trainer writes `paid=1`, `solved=0` for a flush."""
     monkeypatch.setattr(NetHackStaircase, "_is_episode_end", always_solved)
     envs = gym.vector.SyncVectorEnv(
         [
@@ -213,15 +244,52 @@ def test_a_flushed_episode_logs_paid_without_logging_solved(
     envs.close()
 
     assert "episode" in infos, "the horizon should have ended the episode"
-    # the assignment ppo.py makes for the row it writes
     solved = int(int(infos["end_status"][0]) == TASK_SUCCESSFUL)
     paid_mask = infos.get("_paid")
     paid = int(infos["paid"][0]) if paid_mask is not None and paid_mask[0] else solved
     assert (paid, solved) == (1, 0)
 
 
+def test_a_flushed_episode_reaches_the_csv_as_paid_and_unsolved(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`paid` and `solved` reach the episode CSV as written."""
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            FORCE_SOLVED,
+            "--directory", str(tmp_path),
+            "--env-id", DELAYED_STAIRCASE,
+            "--reward-delay", str(HORIZON * 5),
+            "--max-episode-steps", str(HORIZON),
+            "--budget", str(CSV_RUN_BUDGET),
+            "--num-envs", str(CSV_RUN_ENVS),
+            "--num-steps", str(CSV_RUN_STEPS),
+            "--condition", "action",
+            "--seed", str(CSV_RUN_SEED),
+            "--no-cuda",
+            "--no-log-trace",
+        ],
+        cwd=str(HERE),
+        check=True,
+        capture_output=True,
+    )
+
+    with open(tmp_path / f"episodes_seed{CSV_RUN_SEED}.csv", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+
+    assert rows, "the run finished no episode, so no row was written to assert on"
+    assert {(row["paid"], row["solved"]) for row in rows} == {("1", "0")}, (
+        "a flushed hold is paid the bank and still reports no goal"
+    )
+    assert all(
+        int(row["end_status"]) == NetHackStaircase.StepStatus.ABORTED for row in rows
+    ), "the horizon has to be what ended these episodes, not the countdown"
+
+
 def test_an_undelayed_env_reports_no_payout_flag() -> None:
-    """The exp1 env never sets `paid`, so the trainer's fallback to `solved` is live."""
+    """The exp1 env never sets `paid`."""
     env = gym.make(
         "NetHackChallenge-v0", observation_keys=OBSERVATION_KEYS, max_episode_steps=HORIZON
     )
@@ -232,7 +300,7 @@ def test_an_undelayed_env_reports_no_payout_flag() -> None:
 
 
 def test_each_delayed_id_mixes_the_hold_over_its_own_predicate() -> None:
-    """One mixin, three hosts. `HeldGoal` wraps `_is_episode_end` rather than replacing the task."""
+    """`HeldGoal` wraps each host's `_is_episode_end`."""
     hosts = {
         "DelayedStaircase-v0": NetHackStaircase,
         "DelayedStaircasePet-v0": NetHackStaircasePet,
@@ -245,7 +313,7 @@ def test_each_delayed_id_mixes_the_hold_over_its_own_predicate() -> None:
 
 
 def test_the_delayed_envs_enumerate_the_exp1_catalogue() -> None:
-    """exp4's `grammar` is the same catalogue as exp1. Goal tasks default to `TASK_ACTIONS` (49 rows, no DIR)."""
+    """Delayed envs enumerate the same catalogue as exp1."""
     challenge = gym.make(
         "NetHackChallenge-v0", observation_keys=OBSERVATION_KEYS, max_episode_steps=HORIZON
     )
@@ -262,7 +330,7 @@ def test_the_delayed_envs_enumerate_the_exp1_catalogue() -> None:
 
 
 def test_a_delay_on_an_env_without_the_mechanism_is_rejected() -> None:
-    """`--reward-delay` on the exp1 env is a mistake, not a no-op."""
+    """`--reward-delay` on the exp1 env is rejected."""
     with pytest.raises(AssertionError, match="no delay mechanism"):
         make_env(
             env_id="NetHackChallenge-v0",
@@ -280,7 +348,7 @@ def test_a_delay_on_an_env_without_the_mechanism_is_rejected() -> None:
 
 
 def test_the_delay_reaches_the_env_through_make_env() -> None:
-    """`make_env` builds the delayed class directly. `gym.make` would add a TimeLimit and leave NLE's horizon at 5000."""
+    """`make_env` builds the delayed class and sets the delay."""
     reward_delay = 12
     env = make_env(
         env_id=DELAYED_STAIRCASE,

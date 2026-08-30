@@ -1,23 +1,13 @@
-"""Tests for the episode record and the decision trace.
-
-These columns are written once per episode and read only offline, so a wrong one
-stays wrong until the analysis and still plots. The two pinned hardest are the
-ones that would look plausible: the terminal game state, which NetHack zeroes
-the moment the game ends, and the two discount conventions, which differ only in
-which of the wrapper's two sums they accumulate.
-
-The trace is an independent record of the same rollout, so the episode returns
-are checked by recomputing them from the parts rather than by restating the
-trainer's arithmetic.
-"""
+"""Episode record and decision-trace tests."""
 
 import csv
 import json
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
-from typing import Dict, List
+from typing import TYPE_CHECKING, Dict, List, Tuple
 
 import gymnasium as gym
 import numpy as np
@@ -25,6 +15,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 import torch
+import torch.nn as nn
+import torch.optim as optim
 from nle import nethack
 
 from envs import OBSERVATION_KEYS, make_env
@@ -37,8 +29,16 @@ from ppo import (
     TRACE_BLSTATS_FIELDS,
     TRACE_DEVICE_FIELDS,
     TRACE_SCHEMA,
+    Args,
+    load_checkpoint,
+    next_trace_part,
+    provenance_record,
+    save_checkpoint,
     trace_device_columns,
 )
+
+if TYPE_CHECKING:
+    from _pytest.monkeypatch import MonkeyPatch
 
 HERE = pathlib.Path(__file__).resolve().parent.parent
 
@@ -53,38 +53,55 @@ RUN_BUDGET = 6_000
 RUN_MAX_EPISODE_STEPS = 400
 RUN_OPTIONS = 32
 RUN_TRACE_FLUSH = 2
-"""One short run, shared by every test that reads its output. `option`, because
-it is the only condition whose decisions span more than one primitive step and
-so the only one under which the two discount conventions can disagree. Flush every
-two iterations so the cadence fires; at the default 64 this run is one row group."""
+"""Shared `option` run; flush=2 so row-group cadence fires."""
 
 SHORT_EPISODE = 100
 
 
+def ppo_argv(directory: pathlib.Path, *extra: str, budget: int = RUN_BUDGET) -> List[str]:
+    """Argv for one short run into `directory`."""
+    return [
+        sys.executable,
+        str(HERE / "ppo.py"),
+        "--directory", str(directory),
+        "--budget", str(budget),
+        "--num-envs", str(RUN_ENVS),
+        "--num-steps", str(RUN_STEPS),
+        "--max-episode-steps", str(RUN_MAX_EPISODE_STEPS),
+        "--condition", "option",
+        "--n-options", str(RUN_OPTIONS),
+        "--seed", str(RUN_SEED),
+        "--trace-flush-iterations", str(RUN_TRACE_FLUSH),
+        "--no-cuda",
+        *extra,
+    ]
+
+
 @pytest.fixture(scope="module")
 def training_run(tmp_path_factory: pytest.TempPathFactory) -> pathlib.Path:
-    """The run directory of one completed short training run."""
+    """Directory of one completed short run."""
     directory = tmp_path_factory.mktemp("training_run")
+    subprocess.run(ppo_argv(directory), cwd=str(HERE), check=True, capture_output=True)
+    return directory
+
+
+@pytest.fixture(scope="module")
+def kept_run(tmp_path_factory: pytest.TempPathFactory) -> pathlib.Path:
+    """Directory of one completed run that kept its checkpoint."""
+    directory = tmp_path_factory.mktemp("kept_run")
     subprocess.run(
-        [
-            sys.executable,
-            str(HERE / "ppo.py"),
-            "--directory", str(directory),
-            "--budget", str(RUN_BUDGET),
-            "--num-envs", str(RUN_ENVS),
-            "--num-steps", str(RUN_STEPS),
-            "--max-episode-steps", str(RUN_MAX_EPISODE_STEPS),
-            "--condition", "option",
-            "--n-options", str(RUN_OPTIONS),
-            "--seed", str(RUN_SEED),
-            "--trace-flush-iterations", str(RUN_TRACE_FLUSH),
-            "--no-cuda",
-        ],
+        ppo_argv(directory, "--keep-checkpoint"),
         cwd=str(HERE),
         check=True,
         capture_output=True,
     )
     return directory
+
+
+def tiny_trainer() -> Tuple[nn.Module, optim.Adam]:
+    """Stand-in `Agent` for the checkpoint functions."""
+    agent = nn.Linear(2, 2)
+    return agent, optim.Adam(agent.parameters(), lr=1e-4, eps=1e-5)
 
 
 @pytest.fixture(scope="module")
@@ -105,18 +122,13 @@ def decision_parts(run: pathlib.Path) -> List[pathlib.Path]:
 
 @pytest.fixture(scope="module")
 def trace(training_run: pathlib.Path) -> Dict[str, np.ndarray]:
-    """Every part of the run concatenated in part then row-group order."""
+    """Concatenated trace parts in part then row-group order."""
     table = pa.concat_tables([pq.read_table(path) for path in decision_parts(training_run)])
     return {field.name: table.column(field.name).to_numpy() for field in TRACE_SCHEMA}
 
 
 def completed_episodes(trace: Dict[str, np.ndarray], env_index: int) -> List[np.ndarray]:
-    """Row indices of each finished episode in one lane, oldest first.
-
-    `done` marks the phantom transition that follows an episode end, so an
-    episode is a maximal run of `done == 0` rows closed by a phantom. A trailing
-    run with no phantom after it is the episode still in flight, and is dropped.
-    """
+    """Row indices of each finished episode in one lane, oldest first."""
     lane = np.flatnonzero(trace["env_id"] == env_index)
     blocks: List[np.ndarray] = []
     current: List[int] = []
@@ -131,7 +143,7 @@ def completed_episodes(trace: Dict[str, np.ndarray], env_index: int) -> List[np.
 
 
 def test_message_is_observed_but_never_reaches_the_encoder() -> None:
-    """`message` is on the env for the episode record only; the network's whitelist is unchanged."""
+    """`message` is observed for the record; the encoder does not read it."""
     assert "message" in OBSERVATION_KEYS
     assert set(ENCODER_OBS_DTYPE) == {"glyphs", "blstats"}, (
         "the encoder reads exactly these two; a third key here would change the "
@@ -140,7 +152,7 @@ def test_message_is_observed_but_never_reaches_the_encoder() -> None:
 
 
 def test_the_vector_gives_every_env_its_own_xlogfile() -> None:
-    """Two envs must not share a vardir: the episode record reads the last line of each."""
+    """Each env has its own vardir."""
     envs = gym.vector.SyncVectorEnv(
         [
             make_env(
@@ -169,7 +181,7 @@ def test_the_vector_gives_every_env_its_own_xlogfile() -> None:
 
 
 def test_the_ingame_frame_is_the_last_primitive_of_the_decision() -> None:
-    """On a live step the snapshot is the returned observation, not the state the option started in."""
+    """On a live step the snapshot is the returned observation."""
     env = make_env(
         env_id=ENV_ID,
         seed=0,
@@ -214,12 +226,7 @@ def test_the_ingame_frame_is_the_last_primitive_of_the_decision() -> None:
 
 
 def test_the_ingame_frame_survives_the_game_ending() -> None:
-    """NetHack zeroes blstats and message at game over; the snapshot is the frame before it.
-
-    `up` then northwest escapes the dungeon on turn one, which is a real game
-    end rather than a truncation, so this is the state the episode record would
-    otherwise write as dlvl=0, score=0, turn=0.
-    """
+    """The snapshot is the last live frame; NetHack zeroes the terminal one."""
     env = make_env(
         env_id=ENV_ID,
         seed=0,
@@ -259,7 +266,7 @@ def test_the_ingame_frame_survives_the_game_ending() -> None:
 def test_provenance_is_written_without_a_completed_cell(
     training_run: pathlib.Path,
 ) -> None:
-    """A lone `ppo.py` writes its own provenance. `finish_cell` never ran here, and no group has ever cleared it."""
+    """A lone `ppo.py` writes provenance and does not write `meta.json`."""
     provenance = json.loads(
         (training_run / f"provenance_seed{RUN_SEED}.json").read_text()
     )
@@ -276,7 +283,7 @@ def test_provenance_is_written_without_a_completed_cell(
 def test_the_episode_header_is_the_declared_schema(
     training_run: pathlib.Path,
 ) -> None:
-    """The CSV header is `EPISODE_COLUMNS`, so a reader can trust the schema version."""
+    """The CSV header is `EPISODE_COLUMNS`."""
     with open(training_run / f"episodes_seed{RUN_SEED}.csv", newline="") as handle:
         header = next(csv.reader(handle))
     assert tuple(header) == EPISODE_COLUMNS
@@ -285,7 +292,7 @@ def test_the_episode_header_is_the_declared_schema(
 def test_the_trace_is_one_row_per_decision_at_the_declared_dtypes(
     trace: Dict[str, np.ndarray], training_run: pathlib.Path
 ) -> None:
-    """Parts are int32/float32 and named `decisions_seed{N}_part{K}`."""
+    """One row per decision; columns are the declared dtypes."""
     for path in decision_parts(training_run):
         assert re.fullmatch(
             rf"decisions_seed{RUN_SEED}_part\d{{2}}\.parquet", path.name
@@ -303,7 +310,7 @@ def test_the_trace_is_one_row_per_decision_at_the_declared_dtypes(
 
 
 def test_the_written_schema_matches_the_declared_schema(training_run: pathlib.Path) -> None:
-    """The file's schema is `TRACE_SCHEMA`, not inferred from the first batch."""
+    """The file schema is `TRACE_SCHEMA`."""
     written = pq.read_schema(decision_parts(training_run)[0])
     assert list(written.names) == list(TRACE_SCHEMA.names)
     for written_field, declared in zip(written, TRACE_SCHEMA):
@@ -313,25 +320,20 @@ def test_the_written_schema_matches_the_declared_schema(training_run: pathlib.Pa
 def test_the_trace_row_count_matches_the_buffered_decisions(
     trace: Dict[str, np.ndarray], training_run: pathlib.Path
 ) -> None:
-    """Every iteration writes `num_steps * num_envs` rows, phantoms included."""
-    checkpoint = torch.load(
-        sorted(training_run.glob(f"checkpoint_seed{RUN_SEED}_f*.pt"))[-1],
-        map_location="cpu",
-        weights_only=False,
+    """Every iteration writes `num_steps * num_envs` rows."""
+    n_rows = trace["env_id"].shape[0]
+    per_iteration = RUN_STEPS * RUN_ENVS
+    assert n_rows % per_iteration == 0, (
+        f"{n_rows} rows is not a whole number of iterations of {per_iteration}, "
+        "so an iteration wrote a short batch"
     )
-    expected = checkpoint["iteration"] * RUN_STEPS * RUN_ENVS
-    assert trace["env_id"].shape[0] == expected
+    assert n_rows >= per_iteration
     n_from_files = sum(pq.ParquetFile(path).metadata.num_rows for path in decision_parts(training_run))
-    assert n_from_files == expected
+    assert n_from_files == n_rows
 
 
 def test_the_batched_transfer_matches_seven_separate_ones() -> None:
-    """One stacked `.cpu()` writes the bytes seven per-tensor transfers wrote.
-
-    Values are chosen to catch a cast or an ordering change: negative and
-    fractional entries, which truncate toward zero into an int column, and a
-    distinct value per `(step, env)` cell, which a transposed reshape reorders.
-    """
+    """One stacked `.cpu()` matches seven per-tensor transfers."""
     steps, envs = 3, 4
     (width,) = nethack.BLSTATS_SHAPE
     ramp = torch.arange(steps * envs, dtype=torch.float32).reshape(steps, envs)
@@ -363,15 +365,14 @@ def test_the_batched_transfer_matches_seven_separate_ones() -> None:
 
 
 def test_the_trace_schema_names_every_transferred_column() -> None:
-    """`TRACE_DEVICE_FIELDS` is a split of one transfer, so a schema column it
-    omits is one nothing writes."""
+    """`TRACE_DEVICE_FIELDS` names every transferred column."""
     host_only = ("global_step", "env_id", "term_cause", "undiscounted_reward")
     assert set(TRACE_DEVICE_FIELDS).isdisjoint(host_only)
     assert set(TRACE_DEVICE_FIELDS) | set(host_only) == set(TRACE_SCHEMA.names)
 
 
 def test_a_single_column_reads_without_the_rest(training_run: pathlib.Path) -> None:
-    """Column projection is the reason this is parquet rather than npz."""
+    """A single column reads without the rest."""
     path = decision_parts(training_run)[0]
     table = pq.read_table(path, columns=["value"])
     assert table.column_names == ["value"]
@@ -380,7 +381,7 @@ def test_a_single_column_reads_without_the_rest(training_run: pathlib.Path) -> N
 
 
 def test_row_groups_are_capped_by_the_flush_cadence(training_run: pathlib.Path) -> None:
-    """The bound is the property; `> 1` holds because the fixture forces the cadence to fire."""
+    """Row groups are capped by the flush cadence."""
     parts = decision_parts(training_run)
     assert len(parts) == 1, "a 6k-frame run must not hit the 500k-frame part rotation"
     parquet_file = pq.ParquetFile(parts[0])
@@ -396,7 +397,7 @@ def test_row_groups_are_capped_by_the_flush_cadence(training_run: pathlib.Path) 
 
 
 def test_an_unfinalised_part_leaves_earlier_parts_readable(tmp_path: pathlib.Path) -> None:
-    """A kill after part 0 is closed still leaves that part readable; part 1 is lost."""
+    """A kill after part 0 closes leaves that part readable."""
     script = """
 import os
 import sys
@@ -441,12 +442,7 @@ os._exit(1)
 def test_the_two_discount_conventions_accumulate_different_sums(
     episodes: List[Dict[str, str]], trace: Dict[str, np.ndarray]
 ) -> None:
-    """`return_primitive` discounts the wrapper's sum by elapsed primitives; `return_decision` discounts the undiscounted sum by elapsed decisions.
-
-    Recomputed from the trace, which carries both sums separately, so feeding
-    one sum to both accumulators fails here rather than producing two plausible
-    curves.
-    """
+    """The two discount conventions recompute from different trace sums."""
     blocks = {
         (env_index, int(trace["global_step"][block[-1]])): block
         for env_index in range(RUN_ENVS)
@@ -495,11 +491,7 @@ def test_the_two_discount_conventions_accumulate_different_sums(
 def test_steps_to_first_reward_is_an_episode_index_not_an_offset(
     episodes: List[Dict[str, str]], trace: Dict[str, np.ndarray]
 ) -> None:
-    """The column counts primitives from the episode's start, and freezes at the first one.
-
-    An intra-option offset would sit in `[0, step_limit)` and so fall below the
-    primitives already spent by the decision that earned the reward.
-    """
+    """`steps_to_first_reward` indexes from episode start and freezes at first reward."""
     blocks = {
         (env_index, int(trace["global_step"][block[-1]])): block
         for env_index in range(RUN_ENVS)
@@ -528,15 +520,153 @@ def test_steps_to_first_reward_is_an_episode_index_not_an_offset(
     assert checked, "no episode could be matched to its trace rows"
 
 
-def test_checkpoints_are_named_by_frame_count(training_run: pathlib.Path) -> None:
-    """Checkpoints carry their frame count and never overwrite the previous one."""
-    checkpoints = sorted(training_run.glob("checkpoint_seed*.pt"))
-    assert checkpoints, "the run wrote no checkpoint"
-    for path in checkpoints:
-        assert re.fullmatch(rf"checkpoint_seed{RUN_SEED}_f\d{{9}}\.pt", path.name), (
-            f"{path.name} is not named by its frame count, so a later save "
-            "would overwrite it"
-        )
-    assert not (training_run / f"checkpoint_seed{RUN_SEED}.pt").exists(), (
-        "the frameless name is the one that used to be overwritten"
+def test_a_completed_run_leaves_no_checkpoint(training_run: pathlib.Path) -> None:
+    """A finished run leaves no checkpoint."""
+    assert not list(training_run.glob("checkpoint_seed*")), (
+        "a finished run kept its checkpoint, which is what filled the quota"
     )
+
+
+def test_a_kept_checkpoint_is_one_file_named_by_its_seed(kept_run: pathlib.Path) -> None:
+    """`--keep-checkpoint` keeps one file named by seed."""
+    assert [path.name for path in sorted(kept_run.glob("checkpoint_seed*"))] == [
+        f"checkpoint_seed{RUN_SEED}.pt"
+    ]
+
+
+def test_a_second_save_lands_on_the_first(tmp_path: pathlib.Path) -> None:
+    """A second save overwrites the first in place."""
+    agent, optimizer = tiny_trainer()
+    args = Args(seed=RUN_SEED, num_envs=RUN_ENVS)
+    path = tmp_path / f"checkpoint_seed{RUN_SEED}.pt"
+
+    save_checkpoint(path, agent, optimizer, 500_000, 10, 20, 30, args)
+    save_checkpoint(path, agent, optimizer, 1_000_000, 11, 21, 31, args)
+
+    assert [entry.name for entry in sorted(tmp_path.iterdir())] == [path.name], (
+        "a second save left a second file, so the run still grows with cadence"
+    )
+    assert load_checkpoint(path, agent, optimizer, args) == (1_000_000, 11, 21, 31)
+
+
+def test_a_save_killed_mid_write_leaves_the_previous_checkpoint(
+    tmp_path: pathlib.Path, monkeypatch: "MonkeyPatch"
+) -> None:
+    """A kill mid-write leaves the previous checkpoint intact."""
+    agent, optimizer = tiny_trainer()
+    args = Args(seed=RUN_SEED, num_envs=RUN_ENVS)
+    path = tmp_path / f"checkpoint_seed{RUN_SEED}.pt"
+    save_checkpoint(path, agent, optimizer, 500_000, 10, 20, 30, args)
+    survivor = path.read_bytes()
+
+    def die_mid_write(state: object, target: pathlib.Path) -> None:
+        pathlib.Path(target).write_bytes(b"half a checkpoint")
+        raise RuntimeError("killed mid-write")
+
+    monkeypatch.setattr("ppo.torch.save", die_mid_write)
+    with pytest.raises(RuntimeError):
+        save_checkpoint(path, agent, optimizer, 1_000_000, 11, 21, 31, args)
+
+    assert path.read_bytes() == survivor
+    assert load_checkpoint(path, agent, optimizer, args) == (500_000, 10, 20, 30)
+
+
+def test_the_next_trace_part_follows_the_highest_on_disk(tmp_path: pathlib.Path) -> None:
+    """The next part index is one past the highest on disk."""
+    assert next_trace_part(tmp_path, RUN_SEED) == 0
+    for index in (0, 1, 2):
+        (tmp_path / f"decisions_seed{RUN_SEED}_part{index:02d}.parquet").touch()
+    (tmp_path / f"decisions_seed{RUN_SEED + 1}_part07.parquet").touch()
+    assert next_trace_part(tmp_path, RUN_SEED) == 3, (
+        "another seed's parts were counted, so concurrent seeds would skip indices"
+    )
+
+
+def test_provenance_records_no_resume_for_an_uninterrupted_run(
+    training_run: pathlib.Path,
+) -> None:
+    """An uninterrupted run records no resume."""
+    provenance = json.loads(
+        (training_run / f"provenance_seed{RUN_SEED}.json").read_text()
+    )
+    assert provenance["resumed_at_frames"] == []
+
+
+def test_provenance_accumulates_every_resume(tmp_path: pathlib.Path) -> None:
+    """Each resume appends; it does not replace the list."""
+    path = tmp_path / f"provenance_seed{RUN_SEED}.json"
+    path.write_text(json.dumps(provenance_record(path, None)))
+    path.write_text(json.dumps(provenance_record(path, 1_000)))
+    assert json.loads(path.read_text())["resumed_at_frames"] == [1_000]
+
+    path.write_text(json.dumps(provenance_record(path, 5_000)))
+    assert json.loads(path.read_text())["resumed_at_frames"] == [1_000, 5_000]
+
+
+def test_a_resume_continues_the_run_and_appends_to_its_logs(
+    kept_run: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """A rerun with budget left continues the frame counter and appends logs."""
+    directory = tmp_path / "resumed"
+    shutil.copytree(kept_run, directory)
+    first_part = directory / f"decisions_seed{RUN_SEED}_part00.parquet"
+    rows_in_first_part = pq.ParquetFile(first_part).metadata.num_rows
+    with open(directory / f"episodes_seed{RUN_SEED}.csv", newline="") as handle:
+        episodes_before = list(csv.DictReader(handle))
+    reached = max(int(row["primitive_step"]) for row in episodes_before)
+
+    subprocess.run(
+        ppo_argv(directory, budget=RUN_BUDGET * 2), cwd=str(HERE), check=True, capture_output=True
+    )
+
+    assert pq.ParquetFile(first_part).metadata.num_rows == rows_in_first_part, (
+        "the resume reopened part00, and `ParquetWriter` truncates"
+    )
+    assert (directory / f"decisions_seed{RUN_SEED}_part01.parquet").exists()
+
+    with open(directory / f"episodes_seed{RUN_SEED}.csv", newline="") as handle:
+        episodes_after = list(csv.DictReader(handle))
+    assert len(episodes_after) > len(episodes_before), "the resume finished no episodes"
+    assert episodes_after[: len(episodes_before)] == episodes_before, (
+        "the resume truncated the episodes already logged"
+    )
+    steps = [int(row["primitive_step"]) for row in episodes_after]
+    assert steps == sorted(steps), "the frame counter restarted, so the x-axis doubles back"
+    assert steps[-1] > reached
+
+    resumed = json.loads(
+        (directory / f"provenance_seed{RUN_SEED}.json").read_text()
+    )["resumed_at_frames"]
+    assert len(resumed) == 1 and resumed[0] >= RUN_BUDGET, resumed
+
+
+def test_resuming_a_finished_run_writes_no_trace_part_and_drops_the_checkpoint(
+    kept_run: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """A rerun with no frames left writes no part and drops the checkpoint."""
+    directory = tmp_path / "finished"
+    shutil.copytree(kept_run, directory)
+    parts_before = {
+        path.name: pq.ParquetFile(path).metadata.num_rows
+        for path in directory.glob(f"decisions_seed{RUN_SEED}_part*.parquet")
+    }
+    episodes_before = (directory / f"episodes_seed{RUN_SEED}.csv").read_bytes()
+
+    subprocess.run(ppo_argv(directory), cwd=str(HERE), check=True, capture_output=True)
+
+    parts_after = {
+        path.name: pq.ParquetFile(path).metadata.num_rows
+        for path in directory.glob(f"decisions_seed{RUN_SEED}_part*.parquet")
+    }
+    assert parts_after == parts_before, (
+        "the rerun opened a trace writer for a run with no frames left, so it "
+        "either added an empty part or truncated one"
+    )
+    assert (directory / f"episodes_seed{RUN_SEED}.csv").read_bytes() == episodes_before
+    assert not list(directory.glob("checkpoint_seed*")), (
+        "the rerun reached the budget and kept the checkpoint anyway"
+    )
+    resumed = json.loads(
+        (directory / f"provenance_seed{RUN_SEED}.json").read_text()
+    )["resumed_at_frames"]
+    assert len(resumed) == 1 and resumed[0] >= RUN_BUDGET, resumed

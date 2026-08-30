@@ -31,9 +31,9 @@ Discount = Literal["decision", "primitive"]
 Family = Literal["grammar", "grammar_depth", "random"]
 
 DEPTH_FAMILY: Family = "grammar_depth"
-DEPTH_FAMILY_TAG = "exp3"
-"""The only sweep allowed to name `grammar_depth`, so that `grammar` denotes one
-catalogue in every figure. Asserted by test_only_exp3_names_the_depth_prior."""
+"""Out of the matrix: `grammar` denotes one catalogue in every figure. Still
+selectable as an isolated cell through `ppo.py --option-family`. Asserted by
+test_no_sweep_names_the_depth_prior."""
 
 FULL_CATALOGUE = 227
 """Rows `NetHackChallenge-v0`'s action set admits, so exp2's last n is the whole
@@ -80,19 +80,15 @@ class CellArgs:
     max_episode_steps: int = 100_000
     clip_reward: bool = True
     gamma: float = 0.999
+    ent_coef: float = 0.001
+    learning_rate: float = 1e-4
+    anneal_lr: bool = True
     num_envs: int = 16
     num_steps: int = 128
     trace_flush_iterations: int = 64
     """rollout iterations per parquet row group; matches `ppo.Args`"""
     tag: str = ""
 
-
-CHECKPOINT_KEEP_ALL_TAG = "exp1"
-"""The sweep whose cells keep every checkpoint, all three conditions of it, since
-the headline comparison is the one whose intermediate policies get inspected.
-Every other cell keeps three. Not a `CellArgs` field: it selects a cell rather
-than describing one, and adding it there would put it in the cell name and in
-every `meta.json`."""
 
 _DEFAULT_CELL = CellArgs()
 _NAMED_IF_NONDEFAULT = (
@@ -101,6 +97,9 @@ _NAMED_IF_NONDEFAULT = (
     "gamma",
     "discount",
     "reward_delay",
+    "ent_coef",
+    "learning_rate",
+    "anneal_lr",
 )
 _STRING_TUPLE_FIELDS = ("conditions", "families", "discounts")
 
@@ -142,17 +141,149 @@ SWEEPS: Dict[str, Sweep] = {
             tag="gate0",
         ),
     ),
-    "exp1": Sweep(CellArgs(tag="exp1")),
+    "gate1": Sweep(
+        CellArgs(
+            env_id="NetHackChallenge-v0",
+            reward_delay=0,
+            max_episode_steps=5_000,
+            budget=300_000,
+            tag="gate1",
+        ),
+        seeds=(0,),
+    ),
+    
+    "pilot-gamma": Sweep(
+        CellArgs(
+            env_id="DelayedStaircase-v0",
+            max_episode_steps=5_000,
+            budget=5_000_000,
+            gamma=0.99,
+            tag="pilot-gamma",
+        ),
+        conditions=("option",),
+    ),
+    "pilot-ent": Sweep(
+        CellArgs(
+            env_id="DelayedStaircase-v0",
+            max_episode_steps=5_000,
+            budget=5_000_000,
+            ent_coef=0.05,
+            tag="pilot-ent",
+        ),
+        conditions=("option",),
+    ),
+    "pilot-lr": Sweep(
+        CellArgs(
+            env_id="DelayedStaircase-v0",
+            max_episode_steps=5_000,
+            budget=5_000_000,
+            gamma=0.99,
+            ent_coef=0.01,
+            learning_rate=3e-4,
+            anneal_lr=False,
+            tag="pilot-lr",
+        ),
+        conditions=("option",),
+    ),
+    "pilot-smdp": Sweep(
+        CellArgs(
+            env_id="DelayedStaircase-v0",
+            max_episode_steps=5_000,
+            budget=5_000_000,
+            gamma=0.99,
+            ent_coef=0.01,
+            discount="primitive",
+            tag="pilot-smdp",
+        ),
+        conditions=("action", "option"),
+    ),
+    "pilot-smdp-lr": Sweep(
+        CellArgs(
+            env_id="DelayedStaircase-v0",
+            max_episode_steps=5_000,
+            budget=5_000_000,
+            gamma=0.99,
+            ent_coef=0.01,
+            discount="primitive",
+            learning_rate=3e-4,
+            anneal_lr=False,
+            tag="pilot-smdp-lr",
+        ),
+        conditions=("action", "option"),
+    ),
+    "pilot-horizon": Sweep(
+        CellArgs(
+            env_id="DelayedStaircase-v0",
+            max_episode_steps=5_000,
+            budget=5_000_000,
+            gamma=0.999,
+            ent_coef=0.01,
+            discount="primitive",
+            learning_rate=1e-4,
+            tag="pilot-horizon",
+        ),
+        conditions=("option","action"),
+    ),
+    "pilot-50m": Sweep(
+        CellArgs(
+            env_id="DelayedStaircase-v0",
+            max_episode_steps=5_000,
+            budget=50_000_000,
+            gamma=0.999,
+            ent_coef=0.01,
+            discount="primitive",
+            tag="pilot-50m",
+        ),
+        conditions=("option","action"),
+    ),
+    "pilot-challenge": Sweep(
+        CellArgs(
+            env_id="NetHackChallenge-v0",
+            max_episode_steps=5_000,
+            budget=5_000_000,
+            gamma=0.999,
+            ent_coef=0.01,
+            discount="primitive",
+            tag="pilot-challenge",
+        ),
+    ),
+    "exp1": Sweep(
+        CellArgs(
+            env_id="NetHackChallenge-v0",
+            max_episode_steps=5_000,
+            budget=10_000_000,
+            gamma=0.999,
+            ent_coef=0.01,
+            discount="primitive",
+            tag="exp1",
+        ),
+    ),
+    "exp1-pilot": Sweep(
+    CellArgs(
+        env_id="DelayedStaircase-v0",
+        max_episode_steps=5_000,
+        reward_delay=0,
+        budget=5_000_000,
+        tag="exp1-pilot",),
+    ),
     "exp2": Sweep(
-        CellArgs(tag="exp2"),
+        CellArgs(
+            env_id="NetHackChallenge-v0",
+            max_episode_steps=5_000,
+            budget=10_000_000,
+            gamma=0.999,
+            ent_coef=0.01,
+            discount="primitive",
+            tag="exp2",
+        ),
         n_options=(8, 16, 32, 64, 128, FULL_CATALOGUE),
     ),
     # n=64, not the full catalogue: at 227 every family returns the whole thing
-    # and the three coincide
+    # and the families coincide
     "exp3": Sweep(
         CellArgs(tag="exp3"),
         conditions=("option",),
-        families=("grammar", DEPTH_FAMILY, "random"),
+        families=("grammar", "random"),
         option_seeds=(0, 1, 2, 3, 4),
     ),
     # one sweep, so both discount arms land in one run group: plot.py slices its
@@ -379,6 +510,11 @@ def ppo_command(cell: Cell, seed: int) -> List[str]:
         str(args.max_episode_steps),
         "--gamma",
         str(args.gamma),
+        "--ent-coef",
+        str(args.ent_coef),
+        "--learning-rate", 
+        str(args.learning_rate),
+        *(() if args.anneal_lr else ("--no-anneal-lr",)),
         "--num-envs",
         str(args.num_envs),
         "--num-steps",
@@ -388,8 +524,6 @@ def ppo_command(cell: Cell, seed: int) -> List[str]:
         "--tag",
         args.tag,
         "--clip-reward" if args.clip_reward else "--no-clip-reward",
-        "--checkpoint-keep",
-        "all" if args.tag == CHECKPOINT_KEEP_ALL_TAG else "endpoints",
         "--trace-flush-iterations",
         str(args.trace_flush_iterations),
     ]

@@ -36,7 +36,7 @@ MASKED_LOGIT = -1e8
 HIDDEN_DIM = 512
 
 CHECKPOINT_EVERY_FRAMES = 500_000
-"""Checkpoint cadence in primitive steps. No resume: NLE env state is not serialised."""
+"""Checkpoint cadence in primitive steps, and so the most a crash can cost."""
 
 LOG_SCHEMA_VERSION = 4
 """Bump on `EPISODE_COLUMNS`, `TRACE_SCHEMA`, or `TERM_CAUSE_NAMES`."""
@@ -182,8 +182,8 @@ class Args:
     """one row per `envs.step` (decisions, not primitives)"""
     trace_flush_iterations: int = 64
     """rollout iterations per parquet row group. Not the optimizer-step `updates` counter."""
-    checkpoint_keep: Literal["all", "endpoints"] = "endpoints"
-    """`endpoints` is first, midpoint, last. `all` is every cadence hit."""
+    keep_checkpoint: bool = False
+    """keep the checkpoint once the budget is reached, for a cell to be probed or demoed later"""
     directory: str = ""
     """cell directory written by main.py. Empty: a standalone run under results/"""
     tag: str = ""
@@ -347,7 +347,8 @@ def save_checkpoint(
     updates: int,
     args: Args,
 ) -> None:
-    """Write trainer state. Does not include env states; do not resume from this."""
+    """Write trainer state. Env states are not included, so a resume starts fresh episodes."""
+    staging = path.with_name(path.name + ".tmp")
     torch.save(
         {
             "model": agent.state_dict(),
@@ -365,8 +366,70 @@ def save_checkpoint(
             "env_seeds": [args.seed + index for index in range(args.num_envs)],
             "args": vars(args),
         },
-        path,
+        staging,
     )
+    # same directory, so the rename is atomic: a kill mid-write leaves the previous checkpoint
+    os.replace(staging, path)
+
+
+def load_checkpoint(
+    path: pathlib.Path,
+    agent: nn.Module,
+    optimizer: optim.Adam,
+    args: Args,
+) -> Tuple[int, int, int, int]:
+    """Restore trainer state and the RNG streams, returning `(frames, decisions, iteration, updates)`."""
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    assert checkpoint["args"]["seed"] == args.seed, (
+        f"{path.name} was written by seed {checkpoint['args']['seed']}, not {args.seed}"
+    )
+    agent.load_state_dict(checkpoint["model"])
+    optimizer.load_state_dict(checkpoint["optimizer"])
+
+    rng = checkpoint["rng"]
+    random.setstate(rng["python"])
+    np.random.set_state(rng["numpy"])
+    torch.set_rng_state(rng["torch"])
+    cuda_states = rng["cuda"]
+    if cuda_states is not None and torch.cuda.is_available():
+        if len(cuda_states) == torch.cuda.device_count():
+            torch.cuda.set_rng_state_all(cuda_states)
+        else:
+            # `main.py` pins the child to one device with CUDA_VISIBLE_DEVICES, so a
+            # checkpoint written by a standalone run carries a state per visible device
+            torch.cuda.set_rng_state(cuda_states[0])
+    return (
+        checkpoint["frames"],
+        checkpoint["decisions"],
+        checkpoint["iteration"],
+        checkpoint["updates"],
+    )
+
+
+def provenance_record(path: pathlib.Path, resumed_at: Optional[int]) -> Dict[str, object]:
+    """The provenance to write, appending `resumed_at` to the frames already recorded at `path`."""
+    resumed_at_frames: List[int] = []
+    if path.exists():
+        resumed_at_frames = list(json.loads(path.read_text()).get("resumed_at_frames", []))
+    if resumed_at is not None:
+        resumed_at_frames.append(resumed_at)
+    return {
+        "git_sha": git_sha(),
+        "nle_version": nle.__version__,
+        "host": socket.gethostname(),
+        "log_schema_version": LOG_SCHEMA_VERSION,
+        # a resumed seed reset its envs, so its episodes are not one uninterrupted run
+        "resumed_at_frames": resumed_at_frames,
+    }
+
+
+def next_trace_part(run_dir: pathlib.Path, seed: int) -> int:
+    """One past the highest part index on disk. `ParquetWriter` truncates, so a resume must not reopen one."""
+    indices = [
+        int(path.stem.rsplit("part", 1)[1])
+        for path in run_dir.glob(f"decisions_seed{seed}_part*.parquet")
+    ]
+    return max(indices, default=-1) + 1
 
 
 def _step_to_range(delta: float, num_steps: int) -> torch.Tensor:
@@ -577,18 +640,6 @@ if __name__ == "__main__":
     """Flushed per update. A flush per episode is a syscall inside the rollout."""
 
     host = socket.gethostname()
-    # not `meta.json`: main.py writes that only when every seed of the cell succeeded
-    (run_dir / f"provenance_seed{args.seed}.json").write_text(
-        json.dumps(
-            {
-                "git_sha": git_sha(),
-                "nle_version": nle.__version__,
-                "host": host,
-                "log_schema_version": LOG_SCHEMA_VERSION,
-            },
-            indent=2,
-        )
-    )
 
     trace_part = 0
     trace_filled = 0
@@ -603,12 +654,6 @@ if __name__ == "__main__":
             )
             for field in TRACE_SCHEMA
         }
-        trace_writer = pq.ParquetWriter(
-            run_dir / f"decisions_seed{args.seed}_part{trace_part:02d}.parquet",
-            TRACE_SCHEMA,
-            compression="zstd",
-            compression_level=3,
-        )
 
         def flush_trace_row_group() -> None:
             """Write the buffered decisions as one row group and empty the buffer."""
@@ -741,9 +786,6 @@ if __name__ == "__main__":
     decisions = 0
     iteration = 0
     updates = 0
-    last_checkpoint_frames = 0
-    wrote_first_checkpoint = False
-    wrote_midpoint_checkpoint = False
     start_time = time.time()
     next_obs_np, next_infos = envs.reset(seed=args.seed)
     next_obs = to_device(next_obs_np)
@@ -752,6 +794,32 @@ if __name__ == "__main__":
     next_fallback_np = np.asarray(next_infos["initiation_empty"], dtype=bool)
     next_done = torch.zeros(args.num_envs).to(device)
     next_done_np = np.zeros(args.num_envs, dtype=bool)
+
+    # after `envs.reset`, which would otherwise draw from the streams this restores
+    checkpoint_path = run_dir / f"checkpoint_seed{args.seed}.pt"
+    resumed_at: Optional[int] = None
+    if checkpoint_path.exists():
+        frames, decisions, iteration, updates = load_checkpoint(
+            checkpoint_path, agent, optimizer, args
+        )
+        resumed_at = frames
+        print(f"resumed at frames={frames}, decisions={decisions}, updates={updates}")
+    last_checkpoint_frames = frames
+
+    # not `meta.json`: main.py writes that only when every seed of the cell succeeded
+    provenance_path = run_dir / f"provenance_seed{args.seed}.json"
+    provenance_path.write_text(
+        json.dumps(provenance_record(provenance_path, resumed_at), indent=2)
+    )
+
+    if args.log_trace and frames < args.budget:
+        trace_part = next_trace_part(run_dir, args.seed)
+        trace_writer = pq.ParquetWriter(
+            run_dir / f"decisions_seed{args.seed}_part{trace_part:02d}.parquet",
+            TRACE_SCHEMA,
+            compression="zstd",
+            compression_level=3,
+        )
 
     while frames < args.budget:
         iteration += 1
@@ -1090,7 +1158,7 @@ if __name__ == "__main__":
             if args.target_kl is not None and approx_kl > args.target_kl:
                 break
 
-        y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
+        y_pred, y_true = b_values[b_masks.bool()].cpu().numpy(), b_returns[b_masks.bool()].cpu().numpy()
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
@@ -1159,35 +1227,17 @@ if __name__ == "__main__":
                     compression="zstd",
                     compression_level=3,
                 )
-            past_midpoint = frames >= args.budget // 2
-            if (
-                args.checkpoint_keep == "all"
-                or not wrote_first_checkpoint
-                or (past_midpoint and not wrote_midpoint_checkpoint)
-            ):
-                save_checkpoint(
-                    run_dir / f"checkpoint_seed{args.seed}_f{frames:09d}.pt",
-                    agent,
-                    optimizer,
-                    frames,
-                    decisions,
-                    iteration,
-                    updates,
-                    args,
-                )
-                wrote_first_checkpoint = True
-                wrote_midpoint_checkpoint = wrote_midpoint_checkpoint or past_midpoint
+            save_checkpoint(
+                checkpoint_path, agent, optimizer, frames, decisions, iteration, updates, args
+            )
 
-    save_checkpoint(
-        run_dir / f"checkpoint_seed{args.seed}_f{frames:09d}.pt",
-        agent,
-        optimizer,
-        frames,
-        decisions,
-        iteration,
-        updates,
-        args,
-    )
+    if args.keep_checkpoint:
+        save_checkpoint(
+            checkpoint_path, agent, optimizer, frames, decisions, iteration, updates, args
+        )
+    elif checkpoint_path.exists():
+        # the budget is spent, so the only thing it could buy is a resume with nothing to do
+        checkpoint_path.unlink()
     envs.close()
     writer.close()
     csv_file.close()

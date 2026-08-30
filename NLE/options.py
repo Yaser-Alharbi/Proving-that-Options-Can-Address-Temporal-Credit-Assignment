@@ -116,6 +116,9 @@ CMAP_NOT_WALKABLE = frozenset({CMAP_STONE, *CMAP_WALLS, *CMAP_CLOSED_DOOR})
 """Stone (also unexplored), walls, closed doors. Diagonal into cmap 13/14 is
 refused in `_is_walkable`; cmap 12 is not."""
 
+BOULDER = 447
+"""`glyph_to_obj` object type. nle exports no boulder constant."""
+
 DIR_REQUIREMENT = {
     nethack.Command.OPEN: NEEDS_CLOSED_DOOR,
     nethack.Command.CLOSE: NEEDS_OPEN_DOOR,
@@ -425,7 +428,9 @@ def _is_open_door(glyph: int) -> bool:
 
 
 def _is_walkable(glyph: int, diagonal: bool) -> bool:
-    """Diagonal into cmap 13/14 is refused; cmap 12 is not."""
+    """A boulder is refused; diagonal into cmap 13/14 is refused, cmap 12 is not."""
+    if nethack.glyph_is_object(glyph) and nethack.glyph_to_obj(glyph) == BOULDER:
+        return False
     if not nethack.glyph_is_cmap(glyph):
         return True
     cmap = nethack.glyph_to_cmap(glyph)
@@ -437,7 +442,8 @@ def _is_walkable(glyph: int, diagonal: bool) -> bool:
 MAP_PREDICATE = {
     NEEDS_CLOSED_DOOR: _is_closed_door,
     NEEDS_OPEN_DOOR: _is_open_door,
-    NEEDS_MONSTER: nethack.glyph_is_monster,  # pets included
+    # pets included. Value uncalled: `_initiation` reads the vectorised `_monsters`
+    NEEDS_MONSTER: nethack.glyph_is_monster,
     NEEDS_TRAP: nethack.glyph_is_trap,
 }
 
@@ -465,16 +471,16 @@ def _walkable_neighbours(neighbours: np.ndarray) -> np.ndarray:
     )
 
 
-def _reaim(walkable: np.ndarray, heading: int) -> int:
-    """Where `pi` steps: the heading when open, else the open neighbour nearest to
-    it in angle, else `NO_HEADING`. Read off the map, so a blocked candidate costs
-    no keystroke."""
+def _reaim(walkable: np.ndarray, heading: int, monsters: np.ndarray) -> int:
+    """Where `pi` steps: the heading when open, else the open monster-free neighbour
+    nearest to it in angle, else `NO_HEADING`. Read off the map, so a blocked
+    candidate costs no keystroke."""
     if walkable[heading]:
         return heading
     aim = NO_HEADING
     nearest = FULL_TURN_DEGREES
     for candidate, bearing in enumerate(COMPASS_BEARING):
-        if candidate == heading or not walkable[candidate]:
+        if candidate == heading or not walkable[candidate] or monsters[candidate]:
             continue
         offset = abs(bearing - COMPASS_BEARING[heading])
         offset = min(offset, FULL_TURN_DEGREES - offset)
@@ -536,6 +542,7 @@ class OptionWrapper(gym.Wrapper):
         """Last frame the env returned. A decision that finds nowhere to step sends
         no keystroke and still has to report against a state."""
         self._neighbours = np.full(len(COMPASS), nethack.NO_GLYPH)
+        self._monsters = np.zeros(len(COMPASS), dtype=bool)
         self._occupied = 0
         """Neighbours and slot count `interact_failed` diffs against."""
         self._initiation_empty = False
@@ -589,10 +596,11 @@ class OptionWrapper(gym.Wrapper):
         discount = 1.0
         drained = 0
         while True:
-            assert drained < DRAIN_LIMIT, (
-                f"{drained} keystrokes have not cleared misc={tuple(obs['misc'])}; "
-                f"{DRAIN_KEY!r} no longer answers every modal state"
-            )
+            if drained >= DRAIN_LIMIT:
+                raise RuntimeError(
+                    f"{drained} keystrokes have not cleared misc={tuple(obs['misc'])}; "
+                    f"{DRAIN_KEY!r} no longer answers every modal state"
+                )
             obs, reward, terminated, truncated, info = self._primitive(self._drain_key)
             reward_sum += discount * reward
             discount *= self.gamma
@@ -603,15 +611,20 @@ class OptionWrapper(gym.Wrapper):
     def _initiation(self, obs: Dict[str, np.ndarray]) -> np.ndarray:
         """`I` as a bool mask.
 
-        Movement: first cell walkable (not stone/walls/closed door; diagonal
-        refuses cmap 13/14, not doorway 12), or any cell walkable for a following
-        row, which can route around the heading. Empty mask offers everything
+        Movement: first cell walkable (not stone/walls/closed door/boulder;
+        diagonal refuses cmap 13/14, not doorway 12). A following row is also
+        offered a walkable monster-free cell off its heading, which is exactly
+        what `_reaim` will steer to. Empty mask offers everything
         (`grammar_depth` n<=80 is movement only).
         """
         self._neighbours = _neighbour_glyphs(
             obs["glyphs"],
             int(obs["blstats"][nethack.NLE_BL_X]),
             int(obs["blstats"][nethack.NLE_BL_Y]),
+        )
+        # `dtype=bool` so `~` is a logical not; a non-bool array would invert `can_follow`
+        self._monsters = np.asarray(
+            nethack.glyph_is_monster(self._neighbours), dtype=bool
         )
         self._occupied = int((obs["inv_letters"] != EMPTY_SLOT).sum())
 
@@ -620,14 +633,21 @@ class OptionWrapper(gym.Wrapper):
             self.required_slots, obs["inv_letters"]
         )
         walkable = _walkable_neighbours(self._neighbours)
+        open_heading = walkable[self.headings]
+        # exact negation of `_reaim`'s NO_HEADING, so an offered row spends a keystroke
+        can_follow = open_heading | (walkable & ~self._monsters).any()
         available |= (self.requires == NEEDS_WALKABLE) & np.where(
-            self.follows, walkable.any(), walkable[self.headings]
+            self.follows, can_follow, open_heading
         )
         for code, predicate in MAP_PREDICATE.items():
             rows = self.requires == code
             if not rows.any():
                 continue
-            met = np.array([predicate(int(glyph)) for glyph in self._neighbours])
+            met = (
+                self._monsters
+                if code == NEEDS_MONSTER
+                else np.array([predicate(int(glyph)) for glyph in self._neighbours])
+            )
             # `NO_HEADING` indexes from the end; `rows` excludes those rows
             available |= rows & met[self.headings]
         self._initiation_empty = not available.any()
@@ -700,11 +720,14 @@ class OptionWrapper(gym.Wrapper):
         # loop locals, not fields
         position = self._position
         neighbours = self._neighbours
+        monsters = self._monsters
         obs, info = self._frame
         terminated = truncated = False
         while True:
             if row.follow:
-                aim = _reaim(_walkable_neighbours(neighbours), row.heading)
+                aim = _reaim(
+                    _walkable_neighbours(neighbours), row.heading, monsters
+                )
                 blocked = aim == NO_HEADING
             status = _status(row, prompted, keys_sent, moves, detoured, blocked)
             if status == STATUS_DONE:
@@ -734,6 +757,9 @@ class OptionWrapper(gym.Wrapper):
             position = self._position
             if row.follow:
                 neighbours = _neighbour_glyphs(obs["glyphs"], *self._position)
+                monsters = np.asarray(
+                    nethack.glyph_is_monster(neighbours), dtype=bool
+                )
         drained = 0
         modal = not (terminated or truncated) and bool(obs["misc"].any())
         if modal and self._prompt_pending:

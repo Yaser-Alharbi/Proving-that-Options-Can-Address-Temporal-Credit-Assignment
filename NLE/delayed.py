@@ -21,27 +21,18 @@ from nle.env.tasks import NetHackOracle, NetHackStaircase, NetHackStaircasePet
 
 
 class HeldGoal:
-    """Latches the goal, waits `reward_delay` primitive steps, then ends the episode.
-
-    The delay compresses the payout rather than deleting it. If the horizon
-    arrives with the latch still open, `_check_abort` fires ABORTED, which is
-    terminal, and `_reward_fn` pays the bank on that step: the realised delay is
-    `min(reward_delay, horizon - solve_step)`, which is the quantity exp4's
-    `delay_slack` plots. The banked value is fixed at 1 when the goal fires, so
-    it does not decay with the delay, and an episode that never reaches the goal
-    never latches and keeps its own end status.
-    """
+    """On goal, banks reward and ends episode after `reward_delay` steps."""
 
     def __init__(self, *args: Any, reward_delay: int = 0, **kwargs: Any) -> None:
         self._reward_delay = reward_delay
         self._held: Optional[int] = None
         self._paid = False
-        # the goal tasks default to TASK_ACTIONS, 23 keys, which enumerates to 49
-        # catalogue rows and no directional row at all. `NetHackChallenge` uses
-        # nethack.ACTIONS, so matching it is what makes `grammar` at n=64 the
-        # same 64 options in exp4 as in exp1 and exp2, and it keeps the primitive
-        # action indices aligned across the two envs
+        # Use nethack.ACTIONS for action alignment and catalogue consistency.
+ 
         kwargs.setdefault("actions", nethack.ACTIONS)
+        # Remove per-step reward; dense reward buries the terminal payout.
+ 
+        kwargs.setdefault("penalty_step", 0.0)
         super().__init__(*args, **kwargs)
 
     def reset(self, *args: Any, **kwargs: Any) -> Tuple[Any, Dict[str, Any]]:
@@ -71,7 +62,8 @@ class HeldGoal:
         observation: Any,
         end_status: int,
     ) -> float:
-        """The time penalty every step, and the banked 1 once, on the last one."""
+        """Terminal step pays banked 1 plus time penalty."""
+   
         del action
         time_penalty = self._get_time_penalty(  # type: ignore[attr-defined]
             last_observation, observation

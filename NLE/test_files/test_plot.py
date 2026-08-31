@@ -2,7 +2,7 @@
 
 import argparse
 import pathlib
-from typing import TYPE_CHECKING, Dict, List, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -16,11 +16,15 @@ from plot import (
     CENSOR_FRACTION,
     CONDITION_COLOR,
     CONDITION_LABEL,
+    CROSSING_COLUMN,
     DEFAULT_SOLVED_RATE,
+    DENSE_RETURN_THRESHOLD,
+    ECDF_ZOOM_LIMIT,
     FAMILY_DASH,
     MIN_SEEDS_FOR_IQM,
     NO_INTERACTION,
     STRUCTURED_COLOR,
+    TAIL_EPISODES,
     Inputs,
     MissingData,
     apply_x_scale,
@@ -29,9 +33,11 @@ from plot import (
     collinear,
     condition_solved_rate,
     count_overlay,
+    crossing_column,
     crossing_step,
     delay_advantage,
     delay_crossing_fraction,
+    delay_return,
     delay_slack,
     delay_sweep,
     duration_vs_delay,
@@ -42,10 +48,13 @@ from plot import (
     never_crossed,
     parse_arguments,
     return_curve,
+    return_ecdf,
     series_label,
     settled_steps,
+    shared_estimate,
     solved_rate_for,
     steps_to_threshold,
+    success_curve,
     threshold_table,
     varying_fields,
 )
@@ -63,6 +72,27 @@ CLIMB_POINTS = 10
 
 UNPAID_RETURN = 0.2
 """A return below every solved rate used here."""
+
+BELOW_THRESHOLD = DENSE_RETURN_THRESHOLD - 20.0
+ABOVE_THRESHOLD = DENSE_RETURN_THRESHOLD + 10.0
+"""Scores either side of the dense bar. Both clear any rate, so a cell that crosses at
+`BELOW_THRESHOLD` was read in the units of a payout rather than a score."""
+
+RAISED_THRESHOLD = DENSE_RETURN_THRESHOLD + 5.0
+"""A bar only the post-crossing score clears, for `--solved-threshold`."""
+
+UNREACHED_THRESHOLD = ABOVE_THRESHOLD + 10.0
+"""A bar above every score `dense_episodes` reaches."""
+
+ECDF_SEEDS = 3
+STALE_EPISODES = 200
+"""Episodes before the window `return_ecdf` draws."""
+
+STALE_RETURN = -1.0
+"""Their score, below every score inside the window."""
+
+NEGATIVE_RETURN = -7.0
+"""A NetHack score can go negative, and the detail panel has to reach below it."""
 
 DELAY_SEEDS = MIN_SEEDS_FOR_IQM
 """Enough seeds for the bootstrap branch."""
@@ -116,6 +146,45 @@ def crossings(crossing_seeds: List[int], n_seeds: int) -> pd.Series:
         Inputs(frame, overlay_args()), frame, default_rng()
     ).iloc[0]
 
+def dense_episodes(crossing_seeds: List[int], n_seeds: int) -> pd.DataFrame:
+    """Episodes of a host that pays nothing, scored past the bar only after crossing."""
+    steps = np.arange(0, LAST_STEP + 1, GRID_STEP)
+    return pd.concat([
+        pd.DataFrame({
+            "cell": "group/cell", "group": "group", "env_id": "env",
+            "condition": "option", "family": "grammar",
+            "n_options": 64, "option_seed": 0, "tag": "exp1", "seed": seed,
+            "primitive_step": steps,
+            "paid": 0,
+            "episodic_return": np.where(
+                (seed in crossing_seeds) & (steps >= CROSSING_STEP),
+                ABOVE_THRESHOLD, BELOW_THRESHOLD,
+            ),
+        })
+        for seed in range(n_seeds)
+    ], ignore_index=True)
+
+def ecdf_returns(n_episodes: int, seed: int) -> np.ndarray:
+    """`n_episodes` scores, the ones outside the drawn window marked `STALE_RETURN`."""
+    stale = max(n_episodes - TAIL_EPISODES, 0)
+    return np.concatenate([np.full(stale, STALE_RETURN),
+                           np.arange(n_episodes - stale, dtype=float) + seed])
+
+def ecdf_episodes(n_episodes: int = TAIL_EPISODES + STALE_EPISODES) -> pd.DataFrame:
+    """An action and an option cell of `ECDF_SEEDS` seeds, each scored over its own range."""
+    steps = np.arange(1, n_episodes + 1) * GRID_STEP
+    return pd.concat([
+        pd.DataFrame({
+            "cell": f"group/{condition}", "group": "group", "env_id": "env",
+            "condition": condition,
+            "family": "-" if condition == "action" else "grammar",
+            "n_options": 0 if condition == "action" else 64, "option_seed": 0,
+            "tag": "exp1", "seed": seed, "primitive_step": steps,
+            "episodic_return": ecdf_returns(n_episodes, seed),
+        })
+        for condition in ("action", "option") for seed in range(ECDF_SEEDS)
+    ], ignore_index=True)
+
 def overlay_episodes() -> pd.DataFrame:
     """Action baseline and two option conditions at two catalogue sizes."""
     # from GRID_STEP, not zero: a geometric grid cannot start at a step of zero
@@ -132,10 +201,10 @@ def overlay_episodes() -> pd.DataFrame:
         for condition, n_options in cells for seed in range(2)
     ], ignore_index=True)
 
-def overlay_args() -> argparse.Namespace:
+def overlay_args(solved_threshold: Optional[float] = None) -> argparse.Namespace:
     """Overlay-figure options with smoothing off."""
-    return argparse.Namespace(bins=GRID_POINTS, window=1, solved_threshold=None,
-                              resamples=RESAMPLES)
+    return argparse.Namespace(bins=GRID_POINTS, window=1,
+                              solved_threshold=solved_threshold, resamples=RESAMPLES)
 
 def draw_episodes() -> pd.DataFrame:
     """Both structured catalogues and two random draws."""
@@ -329,6 +398,131 @@ def test_collinear_passes_a_dense_reward() -> None:
                           "episodic_return": [0.0, 0.1, 0.9, 1.0]})
     assert not collinear(frame, "paid", "episodic_return")
 
+
+def test_crossing_column_falls_back_to_the_return_where_nothing_is_paid() -> None:
+    """A payout column that never varies is not a crossing column."""
+    assert crossing_column(dense_episodes([0], 4)) == "episodic_return"
+    assert crossing_column(episodes([0], 4)) == CROSSING_COLUMN
+    assert crossing_column(delay_episodes()) == CROSSING_COLUMN
+
+def test_a_paid_host_keeps_crossing_on_the_payout_rate() -> None:
+    """Where `paid` varies the bar stays a rate, whatever the return is worth."""
+    frame = delay_episodes()
+    column = crossing_column(frame)
+    assert column == CROSSING_COLUMN
+    assert solved_rate_for(Inputs(frame, overlay_args()), frame, column) == pytest.approx(
+        DEFAULT_SOLVED_RATE
+    )
+
+def test_threshold_table_crosses_a_dense_host_on_the_score() -> None:
+    """With nothing paid the bar is a score, and a score below it has not crossed."""
+    frame = dense_episodes(crossing_seeds=[0, 1, 2, 3], n_seeds=4)
+    figure, table = threshold_table(Inputs(frame, overlay_args()))
+    assert set(table.crossing_column) == {"episodic_return"}
+    assert table.solved_rate.to_numpy() == pytest.approx(DENSE_RETURN_THRESHOLD)
+    # a rate would have been cleared by `BELOW_THRESHOLD` at the seed's first episode
+    assert table.point.to_numpy() == pytest.approx(CROSSING_STEP)
+    assert (table.n_crossed == 4).all()
+    plt.close(figure)
+
+def test_a_dense_seed_that_never_reaches_the_score_is_dropped() -> None:
+    """A seed whose score never reaches the bar is excluded, not pinned to its limit."""
+    frame = dense_episodes(crossing_seeds=[0, 1, 2], n_seeds=4)
+    row = steps_to_threshold(Inputs(frame, overlay_args()), frame, default_rng(),
+                             "episodic_return").iloc[0]
+    assert (row.n_crossed, row.n_seeds) == (3, 4)
+    assert row.point == pytest.approx(CROSSING_STEP)
+
+def test_a_dense_cell_censors_below_the_censoring_fraction() -> None:
+    """Below `CENSOR_FRACTION` of seeds reaching the score, the cell reports nothing."""
+    frame = dense_episodes(crossing_seeds=[0], n_seeds=4)
+    assert 1 < CENSOR_FRACTION * 4, "fixture stopped censoring"
+    with pytest.raises(MissingData, match="censored"):
+        threshold_table(Inputs(frame, overlay_args()))
+
+def test_solved_threshold_is_read_in_the_units_of_the_crossed_column() -> None:
+    """On a dense host `--solved-threshold` is a score, not a fraction of episodes."""
+    frame = dense_episodes(crossing_seeds=[0, 1, 2, 3], n_seeds=4)
+    raised = steps_to_threshold(Inputs(frame, overlay_args(RAISED_THRESHOLD)), frame,
+                                default_rng(), "episodic_return")
+    assert raised.solved_rate.to_numpy() == pytest.approx(RAISED_THRESHOLD)
+    # read as a rate it would be measured against a payout column that is always zero
+    assert raised.point.to_numpy() == pytest.approx(CROSSING_STEP)
+    unreachable = steps_to_threshold(Inputs(frame, overlay_args(UNREACHED_THRESHOLD)), frame,
+                                     default_rng(), "episodic_return")
+    assert unreachable.solved_rate.to_numpy() == pytest.approx(UNREACHED_THRESHOLD)
+    assert list(unreachable.method) == ["censored"]
+    assert unreachable.point.isna().all()
+
+def test_success_curve_skips_a_host_that_pays_nothing() -> None:
+    """A payout column stuck at one value is a horizontal line, not a success curve."""
+    with pytest.raises(MissingData, match="every episode"):
+        success_curve(Inputs(dense_episodes([0, 1], 4), overlay_args()))
+
+
+def test_return_ecdf_draws_only_the_last_episodes_of_each_seed() -> None:
+    """Episodes before the drawn window reach neither the table nor the axis."""
+    figure, table = return_ecdf(Inputs(ecdf_episodes(), overlay_args()))
+    assert set(table.n_episodes) == {TAIL_EPISODES}
+    assert table.episodic_return.min() > STALE_RETURN
+    plt.close(figure)
+
+def test_return_ecdf_zooms_a_panel_without_clipping_the_lowest_score() -> None:
+    """The detail panel truncates the right and pads past the lowest score on the left."""
+    frame = ecdf_episodes()
+    # the last row, so the score lands inside the drawn window rather than before it
+    frame.loc[frame.index[-1], "episodic_return"] = NEGATIVE_RETURN
+    figure, table = return_ecdf(Inputs(frame, overlay_args()))
+    full, detail = figure.get_axes()
+    assert table.episodic_return.min() == pytest.approx(NEGATIVE_RETURN)
+    left, right = detail.get_xlim()
+    assert right == pytest.approx(ECDF_ZOOM_LIMIT)
+    assert left < NEGATIVE_RETURN, "the lowest score sits on the panel edge"
+    assert full.get_xlim()[1] > ECDF_ZOOM_LIMIT
+    # the zero the negative scores are read against, on the panel that can resolve it
+    zero = [line for line in detail.lines if str(line.get_label()) == "zero score"]
+    assert [line.get_xdata()[0] for line in zero] == [0.0]
+    assert not [line for line in full.lines if str(line.get_label()) == "zero score"]
+    plt.close(figure)
+
+def test_return_ecdf_draws_one_curve_per_seed_rather_than_a_pool() -> None:
+    """Each seed is its own curve, coloured by its condition and named by its cell."""
+    figure, table = return_ecdf(Inputs(ecdf_episodes(), overlay_args()))
+    axis = figure.get_axes()[0]
+    assert table.groupby(["cell", "seed"]).ngroups == 2 * ECDF_SEEDS
+    # the detail panel carries the same curves plus its zero reference
+    assert [len(panel.lines) for panel in figure.get_axes()] == [2 * ECDF_SEEDS,
+                                                                 2 * ECDF_SEEDS + 1]
+    assert {to_rgb(line.get_color()) for line in axis.lines} == {
+        to_rgb(CONDITION_COLOR[condition]) for condition in ("action", "option")
+    }
+    # one entry per cell: `finish` keeps the first handle of each label
+    assert {str(line.get_label()) for line in axis.lines} == {
+        CONDITION_LABEL["action"], CONDITION_LABEL["option"],
+    }
+    for _, run in table.groupby(["cell", "seed"]):
+        assert run.ecdf.is_monotonic_increasing
+        assert run.ecdf.iloc[-1] == pytest.approx(1.0)
+        assert run.episodic_return.is_monotonic_increasing
+    plt.close(figure)
+
+def test_return_ecdf_keeps_a_seed_that_finished_fewer_episodes() -> None:
+    """A seed shorter than the window contributes every episode it has, and is named."""
+    short = TAIL_EPISODES // 2
+    figure, table = return_ecdf(Inputs(ecdf_episodes(short), overlay_args()))
+    assert set(table.n_episodes) == {short}
+    printed = "\n".join(text.get_text() for text in figure.texts)
+    assert f"{2 * ECDF_SEEDS} seeds finished fewer" in printed
+    plt.close(figure)
+
+def test_return_ecdf_says_it_did_not_aggregate_across_seeds() -> None:
+    """The caption names the seed count and denies an estimator."""
+    figure, table = return_ecdf(Inputs(ecdf_episodes(), overlay_args()))
+    assert set(table.n_seeds) == {ECDF_SEEDS}
+    printed = "\n".join(text.get_text() for text in figure.texts)
+    assert f"{ECDF_SEEDS} seeds, one curve per seed, not aggregated" in printed
+    plt.close(figure)
+
 def test_series_label_omits_a_field_that_cannot_apply() -> None:
     """An action cell is not named by `n_options`."""
     table = pd.DataFrame({
@@ -364,6 +558,15 @@ def identity_table() -> pd.DataFrame:
         "option_seed": 3, "budget": 5_000_000, "max_steps": 2_000, "reward_delay": 32,
         "gamma": 0.99, "discount": "primitive", "tag": "exp4", "n_options": 8,
     }])
+
+def test_a_censored_cell_does_not_strip_the_method_from_the_caption() -> None:
+    """Censoring is the absence of an estimate, not a second estimator."""
+    table = pd.DataFrame({
+        "condition": ["action", "option"], "n_seeds": [5, 5],
+        "method": ["censored", "median-range"],
+    })
+    assert shared_estimate(table) == "5 seeds, median with observed range"
+    assert shared_estimate(table[table.method == "censored"]) == ""
 
 def test_caption_for_resolves_every_identity_column() -> None:
     """Every `IDENTITY` name resolves to a `CellArgs` field."""
@@ -606,6 +809,34 @@ def test_duration_vs_delay_excludes_the_action_condition() -> None:
         assert [str(series.get_label()) for series in axis.containers] == [
             CONDITION_LABEL["option"]
         ]
+    plt.close(figure)
+
+def test_delay_return_is_the_tail_median_against_delay() -> None:
+    """Final return is each seed's tail mean, then median and range over five seeds."""
+    frame = delay_episodes()
+    frame = frame[frame.seed < 5].copy()
+    frame["episodic_return"] = (
+        np.where(frame.condition.eq("action"), 1.0 - frame.reward_delay / 64.0, 0.8)
+        + frame.seed * 0.01
+    )
+    figure, table = delay_return(Inputs(frame, delay_args()))
+    assert set(table.method) == {"median-range"}
+    assert set(table.n_seeds) == {5}
+    keyed = table.set_index(["condition", "discount", "reward_delay"])
+    for discount in DELAY_DISCOUNTS:
+        action_base = keyed.loc[("action", discount, 0)]
+        action_delayed = keyed.loc[("action", discount, 32)]
+        option_base = keyed.loc[("option", discount, 0)]
+        option_delayed = keyed.loc[("option", discount, 32)]
+        assert action_base.point == pytest.approx(1.02)
+        assert (action_base.low, action_base.high) == pytest.approx((1.00, 1.04))
+        assert action_delayed.point == pytest.approx(0.52)
+        assert option_base.point == pytest.approx(0.82)
+        assert option_delayed.point == pytest.approx(0.82)
+    for axis in figure.get_axes():
+        assert {str(series.get_label()) for series in axis.containers} == {
+            CONDITION_LABEL["action"], CONDITION_LABEL["option"],
+        }
     plt.close(figure)
 
 

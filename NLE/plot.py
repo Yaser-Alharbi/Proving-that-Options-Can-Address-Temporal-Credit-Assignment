@@ -39,6 +39,9 @@ PANEL_HEIGHT = 3.2
 ROW_HEIGHT = 0.4
 LINE_WIDTH = 2.0
 BAND_ALPHA = 0.2
+SEED_LINE_ALPHA = 0.6
+"""One line per seed of one colour per condition, so they have to be told apart where
+they overlap."""
 GRID_ALPHA = 0.3
 SMALL_FONT = 7
 LEGEND_FONT = 8
@@ -61,6 +64,29 @@ DEFAULT_SOLVED_RATE = 0.5
 A rate, not a return: an NLE return is the goal reward plus a per-step time penalty, so a
 bar on it conflates solving with solving quickly and moves with the realised episode length.
 """
+
+DENSE_RETURN_THRESHOLD = 60.0
+"""Score a trailing mean must reach where the crossing is read off the return.
+
+A rate cannot serve on a dense host: the return there is a score in the tens, so
+`DEFAULT_SOLVED_RATE` is crossed by the first full window of every seed. Single
+untrained episodes clear this bar; `crossing_step` reads the window mean, which
+is what the bar is set against.
+"""
+
+TAIL_EPISODES = 1_000
+"""Episodes from the end of each seed that `return_ecdf` draws."""
+
+ECDF_ZOOM_LIMIT = 100.0
+"""Right edge of `return_ecdf`'s detail panel.
+
+A weak condition's whole distribution can fall inside a fraction of the range a strong
+one's tail reaches, and on a single axis it draws as a vertical line at the origin.
+"""
+
+ZOOM_MARGIN = 0.05
+"""Fraction of the detail panel's span left below the lowest score, so the episode that
+scored it draws inside the panel rather than on its edge."""
 
 CENSOR_FRACTION = 0.5
 """Seeds that must cross before a cell's steps-to-threshold is reported at all."""
@@ -147,6 +173,7 @@ METHOD_PHRASE: Dict[str, str] = {
     "iqm-bootstrap": f"IQM with {1 - CI_ALPHA:.0%} bootstrap CI",
     "median-range": "median with observed range",
     "median-bootstrap": f"median with {1 - CI_ALPHA:.0%} bootstrap CI",
+    "per-seed": "one curve per seed, not aggregated across seeds",
 }
 """How a method reads on a figure; the sidecar CSVs keep the token itself."""
 
@@ -348,6 +375,20 @@ def tail_of(data: Inputs, run: pd.DataFrame) -> pd.DataFrame:
     reached = run.primitive_step.max()
     return run[run.primitive_step > (1 - data.args.tail) * reached]
 
+def last_episodes(run: pd.DataFrame, count: int) -> pd.DataFrame:
+    """One seed's last `count` episodes, or all of them where it finished fewer."""
+    return run.sort_values("primitive_step").tail(count)
+
+def crossing_column(frame: pd.DataFrame) -> str:
+    """`CROSSING_COLUMN` where it varies, else `episodic_return`.
+
+    A host with no goal to pay writes one value there for every episode, and a bar on a
+    constant is crossed at the first full window or never.
+    """
+    if CROSSING_COLUMN in frame.columns and frame[CROSSING_COLUMN].nunique(dropna=False) > 1:
+        return CROSSING_COLUMN
+    return "episodic_return"
+
 def aggregate_final(data: Inputs, frame: pd.DataFrame, rng: np.random.Generator) -> Estimate:
     """The estimate over each seed's last `--tail` of primitive steps."""
     values, strata = [], []
@@ -356,8 +397,13 @@ def aggregate_final(data: Inputs, frame: pd.DataFrame, rng: np.random.Generator)
         strata.append(stratum_of(run))
     return estimate(np.asarray(values), np.asarray(strata), data.args.resamples, rng)
 
-def solved_rate_for(data: Inputs, cell: pd.DataFrame) -> float:
-    """Solved-rate bar for this cell: `--solved-threshold`, or `DEFAULT_SOLVED_RATE`."""
+def solved_rate_for(data: Inputs, cell: pd.DataFrame,
+                    column: str = CROSSING_COLUMN) -> float:
+    """This cell's bar on `column`: `--solved-threshold`, or the column's own default.
+
+    `--solved-threshold` is taken in the units of whichever column is being crossed, so
+    the same flag names a payout rate on a sparse host and a score on a dense one.
+    """
     declared = data.args.solved_threshold
     if isinstance(declared, dict):
         condition = str(cell.iloc[0].condition)
@@ -365,14 +411,15 @@ def solved_rate_for(data: Inputs, cell: pd.DataFrame) -> float:
             return float(declared[condition])
     elif declared is not None:
         return float(declared)
-    return DEFAULT_SOLVED_RATE
+    return DEFAULT_SOLVED_RATE if column == CROSSING_COLUMN else DENSE_RETURN_THRESHOLD
 
-def cell_crossings(data: Inputs, cell: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+def cell_crossings(data: Inputs, cell: pd.DataFrame,
+                   column: str = CROSSING_COLUMN) -> Tuple[np.ndarray, np.ndarray]:
     """One cell's per-seed crossing steps, NaN where a seed never crossed, and each stratum."""
-    rate = solved_rate_for(data, cell)
+    rate = solved_rate_for(data, cell, column)
     runs = [run for _, run in cell.groupby("seed")]
     return (
-        np.asarray([crossing_step(run, CROSSING_COLUMN, rate, data.args.window)
+        np.asarray([crossing_step(run, column, rate, data.args.window)
                     for run in runs]),
         np.asarray([stratum_of(run) for run in runs]),
     )
@@ -389,11 +436,12 @@ def resampled_points(values: np.ndarray, strata: np.ndarray, resamples: int,
     draws = values[bootstrap_indices(strata, resamples, rng)]
     return float(statistic(values)), np.asarray(statistic(draws, axis=1))
 
-def steps_to_threshold(data: Inputs, frame: pd.DataFrame, rng: np.random.Generator) -> pd.DataFrame:
-    """Primitive steps to reach each cell's solved rate, excluding seeds that never do."""
+def steps_to_threshold(data: Inputs, frame: pd.DataFrame, rng: np.random.Generator,
+                       column: str = CROSSING_COLUMN) -> pd.DataFrame:
+    """Primitive steps to reach each cell's bar on `column`, excluding seeds that never do."""
     rows = []
     for name, cell in frame.groupby("cell"):
-        crossings, strata = cell_crossings(data, cell)
+        crossings, strata = cell_crossings(data, cell, column)
         crossed = np.isfinite(crossings)
         n_seeds, n_crossed = crossings.size, int(crossed.sum())
         # pinning a non-crossing seed to the limit would bias the estimate down by
@@ -403,7 +451,8 @@ def steps_to_threshold(data: Inputs, frame: pd.DataFrame, rng: np.random.Generat
             if n_crossed >= CENSOR_FRACTION * n_seeds else CENSORED
         rows.append({
             "cell": name, "group": cell.group.iloc[0], **first_of(cell),
-            "solved_rate": solved_rate_for(data, cell), **measured, "n_crossed": n_crossed,
+            "crossing_column": column, "solved_rate": solved_rate_for(data, cell, column),
+            **measured, "n_crossed": n_crossed,
             "n_seeds": n_seeds, "limit": curve_window(cell)[1],
         })
     return pd.DataFrame(rows)
@@ -424,20 +473,27 @@ def series_label(row: pd.Series, varying: Sequence[str]) -> str:
     return ", ".join(parts)
 
 def shared_estimate(table: pd.DataFrame) -> str:
-    """`n seeds, method` where every cell of `table` agrees on both, else empty."""
+    """`n seeds, method` where every estimated cell of `table` agrees on both, else empty.
+
+    Censored cells are left out of the agreement: censoring is the absence of an estimate,
+    not a second estimator, and one censored cell would otherwise strip the caption of the
+    method every drawn cell shares.
+    """
     if not {"n_seeds", "method"} <= set(table.columns):
         return ""
-    if table.n_seeds.nunique() != 1 or table.method.nunique() != 1:
+    estimated = table[table.method != CENSORED["method"]]
+    if estimated.empty or estimated.n_seeds.nunique() != 1 or estimated.method.nunique() != 1:
         return ""
-    method = str(table.method.iloc[0])
-    return f"{int(table.n_seeds.iloc[0])} seeds, {METHOD_PHRASE.get(method, method)}"
+    method = str(estimated.method.iloc[0])
+    return f"{int(estimated.n_seeds.iloc[0])} seeds, {METHOD_PHRASE.get(method, method)}"
 
-def solved_rate_phrase(table: pd.DataFrame) -> str:
-    """`solved rate x`, or one bar per condition where the conditions were given their own."""
+def solved_rate_phrase(table: pd.DataFrame, column: str = CROSSING_COLUMN) -> str:
+    """The bar and its units, or one bar per condition where they were given their own."""
+    noun = "solved rate" if column == CROSSING_COLUMN else "episodic return"
     bars = {str(row.condition): float(row.solved_rate) for _, row in table.iterrows()}
     if len(set(bars.values())) == 1:
-        return f"solved rate {next(iter(bars.values())):g}"
-    return "solved rate " + ", ".join(
+        return f"{noun} {next(iter(bars.values())):g}"
+    return f"{noun} " + ", ".join(
         f"{value:g} for {CONDITION_LABEL[condition]}"
         for condition, value in sorted(bars.items(), key=lambda pair: -pair[1]))
 
@@ -711,11 +767,70 @@ def return_curve(data: Inputs) -> Tuple[Figure, pd.DataFrame]:
     frame = require_columns(data.episodes, ("primitive_step", "episodic_return"), "return")
     return curve_figure(data, frame, "episodic_return", "episodic return")
 
+def return_ecdf(data: Inputs) -> Tuple[Figure, pd.DataFrame]:
+    """Episodic return over each seed's last episodes, one empirical CDF per seed.
+
+    Per seed rather than pooled: pooling reads a shift between seeds as a wider
+    distribution within one, which is the question this figure is here to answer.
+    """
+    frame = require_columns(data.episodes, ("primitive_step", "episodic_return"), "ecdf")
+    tables = []
+    for name, cell in frame.groupby("cell"):
+        for seed, run in cell.groupby("seed"):
+            returns = np.sort(last_episodes(run, TAIL_EPISODES).episodic_return.to_numpy())
+            tables.append(pd.DataFrame({
+                "cell": name, "group": cell.group.iloc[0], **first_of(cell), "seed": seed,
+                "episodic_return": returns,
+                "ecdf": np.arange(1, returns.size + 1) / returns.size,
+                "n_episodes": returns.size, "n_seeds": cell.seed.nunique(),
+                "method": "per-seed",
+            }))
+    table = pd.concat(tables, ignore_index=True)
+    varying = varying_fields(table)
+
+    # never narrower than a single-axis figure, which is what the caption is sized for
+    figure, axes = plt.subplots(1, 2, sharey=True, squeeze=False,
+                                figsize=(max(FIGURE_SIZE[0], PANEL_WIDTH * 2),
+                                         FIGURE_SIZE[1]))
+    ordered = table.assign(_condition_at=table.condition.map(list(CONDITION_LABEL).index))
+    for _, run in ordered.sort_values(["_condition_at", *varying, "cell", "seed"]).groupby(
+            ["cell", "seed"], sort=False):
+        first = run.iloc[0]
+        for axis in axes[0]:
+            # post: the curve steps up at the episode's own score rather than before it
+            axis.step(run.episodic_return, run.ecdf, where="post", linewidth=LINE_WIDTH,
+                      alpha=SEED_LINE_ALPHA, color=CONDITION_COLOR[first.condition],
+                      label=series_label(first, varying))
+    for axis in axes[0]:
+        axis.set_xlabel("episodic return (unclipped NetHack score)")
+    axes[0][0].set_title("every episode")
+    axes[0][0].set_ylabel("fraction of episodes at or below")
+    axes[0][0].set_ylim(*FRACTION_YLIM)
+    axes[0][1].set_title(f"detail below {ECDF_ZOOM_LIMIT:g}")
+    axes[0][1].axvline(0.0, color=REFERENCE_COLOR, linestyle=BASELINE_DASH,
+                       linewidth=REFERENCE_WIDTH, label="zero score")
+    # padded past the lowest score rather than cut at zero: a NetHack score goes negative,
+    # and where it does the left tail is the thing this panel exists to show
+    lowest = float(table.episodic_return.min())
+    axes[0][1].set_xlim(lowest - ZOOM_MARGIN * (ECDF_ZOOM_LIMIT - lowest), ECDF_ZOOM_LIMIT)
+    short = table[table.n_episodes < TAIL_EPISODES].groupby(["cell", "seed"]).ngroups
+    finish(figure, list(axes[0]), environments(frame), caption_for(table, varying, (
+        f"last {TAIL_EPISODES:,} episodes of each seed",
+        f"{short} seeds finished fewer and contribute every episode they have"
+        if short else "",
+    )))
+    return figure, table
+
 def success_curve(data: Inputs) -> Tuple[Figure, pd.DataFrame]:
     """Fraction of episodes paid the goal reward, against primitive steps."""
     frame = require_columns(
         data.episodes, ("primitive_step", CROSSING_COLUMN, "episodic_return"), "success"
     )
+    if crossing_column(frame) != CROSSING_COLUMN:
+        raise MissingData(
+            f"{CROSSING_COLUMN} is {frame[CROSSING_COLUMN].iloc[0]:g} in every episode of "
+            "every loaded cell, so a payout rate is a horizontal line"
+        )
     if collinear(frame, CROSSING_COLUMN, "episodic_return"):
         raise MissingData(
             "episodic_return takes one value per payout outcome in every loaded "
@@ -867,14 +982,15 @@ def option_usage(data: Inputs) -> Tuple[Figure, pd.DataFrame]:
     )
 
 def threshold_table(data: Inputs) -> Tuple[Figure, pd.DataFrame]:
-    """Primitive steps to reach the solved rate, as a rendered table."""
-    frame = require_columns(data.episodes, ("primitive_step", CROSSING_COLUMN), "threshold")
-    table = steps_to_threshold(data, frame, np.random.default_rng(BOOTSTRAP_SEED))
+    """Primitive steps to reach the crossing bar, as a rendered table."""
+    column = crossing_column(data.episodes)
+    frame = require_columns(data.episodes, ("primitive_step", column), "threshold")
+    table = steps_to_threshold(data, frame, np.random.default_rng(BOOTSTRAP_SEED), column)
     # a table of every cell censored is an empty table, and its `n_crossed/n_seeds`
     # column would be the only thing on it
     if table.empty or table.point.isna().all():
         raise MissingData(f"every cell is censored: fewer than {CENSOR_FRACTION:.0%} of "
-                          "the seeds of any cell reached its solved rate")
+                          f"the seeds of any cell crossed on {column}")
     varying = varying_fields(table)
     # what separates this cell from the others, as in a legend entry; everything the rows
     # share is in the caption, so the cell name would repeat it on every row
@@ -898,7 +1014,7 @@ def threshold_table(data: Inputs) -> Tuple[Figure, pd.DataFrame]:
     caption = caption_for(table, varying)
     # tight_layout ignores suptitle; a caption at y=1 sits in the title's band
     figure.tight_layout(rect=[0.0, 0.0, 1.0, 0.84 if caption else 0.92])
-    figure.suptitle(f"primitive steps to {solved_rate_phrase(table)} "
+    figure.suptitle(f"primitive steps to {solved_rate_phrase(table, column)} "
                     f"({data.args.window}-episode moving average)",
                     x=0.0, y=0.99, ha="left")
     if caption:
@@ -1126,9 +1242,32 @@ def duration_vs_delay(data: Inputs) -> Tuple[Figure, pd.DataFrame]:
                        (f"realised duration over the final {data.args.tail:.0%} of each seed",)))
     return figure, table
 
+def delay_return(data: Inputs) -> Tuple[Figure, pd.DataFrame]:
+    """Final episodic return against reward delay."""
+    frame = require_columns(
+        data.episodes,
+        ("primitive_step", "episodic_return", "reward_delay", "discount"), "delay return"
+    )
+    rng = np.random.default_rng(BOOTSTRAP_SEED)
+    rows = []
+    for name, cell in frame.groupby("cell"):
+        result = aggregate_final(data, cell, rng)
+        rows.append({"cell": name, "group": cell.group.iloc[0], **first_of(cell),
+                     **result.row(), "n_seeds": result.n_seeds})
+
+    table = shared_across_modes(pd.DataFrame(rows))
+    varying = delay_varying(table)
+    figure, axes, modes = discount_axes(table)
+    for axis, mode in zip(axes[0], modes):
+        delay_series(axis, table[table.discount == mode], "point", ("low", "high"), varying)
+    axes[0][0].set_ylabel(f"episodic return, final {data.args.tail:.0%} of each seed")
+    finish(figure, list(axes.flat), environments(frame), caption_for(table, varying))
+    return figure, table
+
 
 FIGURES: Dict[str, Callable[[Inputs], Tuple[Figure, pd.DataFrame]]] = {
     "return_curve": return_curve,
+    "return_ecdf": return_ecdf,
     "success_curve": success_curve,
     "length_curve": length_curve,
     "option_count_sweep": option_count_sweep,
@@ -1136,6 +1275,7 @@ FIGURES: Dict[str, Callable[[Inputs], Tuple[Figure, pd.DataFrame]]] = {
     "count_overlay": count_overlay,
     "option_usage": option_usage,
     "threshold_table": threshold_table,
+    "delay_return": delay_return,
     "delay_crossing_fraction": delay_crossing_fraction,
     "delay_slack": delay_slack,
     "delay_sweep": delay_sweep,
@@ -1147,11 +1287,11 @@ DISABLED = frozenset({"option_usage"})
 """Registered but not drawn unless named; each raises `MissingData` saying why."""
 
 EXPERIMENT_FIGURES: Dict[str, Tuple[str, ...]] = {
-    "exp1": ("return_curve", "threshold_table", "length_curve"),
+    "exp1": ("return_curve", "return_ecdf", "threshold_table", "length_curve"),
     "exp2": ("option_count_sweep", "threshold_table", "count_overlay"),
-    "exp3": ("return_curve", "threshold_table", "family_overlay"),
-    "exp4": ("delay_crossing_fraction", "delay_slack", "delay_sweep", "delay_advantage",
-             "duration_vs_delay"),
+    "exp3": ("return_curve", "threshold_table",),
+    "exp4": ("delay_return", "delay_crossing_fraction", "delay_slack", "delay_sweep",
+             "delay_advantage", "duration_vs_delay"),
 }
 """What each experiment's tag is there to show; an untagged or unknown group draws
 everything not `DISABLED`."""
@@ -1195,9 +1335,12 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--window", type=int, default=100)
     parser.add_argument("--tail", type=float, default=0.1)
     parser.add_argument("--solved-threshold", type=condition_solved_rate,
-                        help="fraction of a window's episodes that must be paid the goal "
-                             f"reward, default {DEFAULT_SOLVED_RATE:g}; `option=0.9` sets "
-                             "one condition and leaves the rest")
+                        help="bar a window's trailing mean must reach, in the units of "
+                             "whatever is crossed: a fraction of episodes paid the goal "
+                             f"reward, default {DEFAULT_SOLVED_RATE:g}, or an episodic "
+                             f"return where no cell is paid, default "
+                             f"{DENSE_RETURN_THRESHOLD:g}; `option=0.9` sets one condition "
+                             "and leaves the rest")
     parser.add_argument("--resamples", type=int, default=2000)
     return parser.parse_args(argv)
 

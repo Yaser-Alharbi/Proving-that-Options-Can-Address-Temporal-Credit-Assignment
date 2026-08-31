@@ -280,11 +280,25 @@ SWEEPS: Dict[str, Sweep] = {
     ),
     # n=64, not the full catalogue: at 227 every family returns the whole thing
     # and the families coincide
-    "exp3": Sweep(
-        CellArgs(tag="exp3"),
+    "exp3-old": Sweep(
+        CellArgs(tag="exp3-old"),
         conditions=("option",),
         families=("grammar", "random"),
         option_seeds=(0, 1, 2, 3, 4),
+    ),
+    "exp3": Sweep(
+        CellArgs(
+            env_id="NetHackChallenge-v0",
+            max_episode_steps=5_000,
+            budget=10_000_000,
+            gamma=0.999,
+            ent_coef=0.01,
+            discount="primitive",
+            tag="exp3",
+        ),
+        conditions=("option",),
+        families=("grammar", "random"),
+        option_seeds=(0, 1, 2),
     ),
     # one sweep, so both discount arms land in one run group: plot.py slices its
     # inputs per group and a figure panelled by `discount` needs to see both
@@ -297,6 +311,36 @@ SWEEPS: Dict[str, Sweep] = {
         conditions=("action", "option"),
         reward_delays=(0, 8, 16, 32, 64),
         discounts=("decision", "primitive"),
+    ),
+    "exp4-pilot": Sweep(
+        CellArgs(
+            env_id="DelayedChallenge-v0",
+            max_episode_steps=5_000,
+            budget=5_000_000,
+            gamma=0.999,
+            ent_coef=0.01,
+            learning_rate=1e-4,
+            anneal_lr=True,
+            discount="primitive",
+            tag="exp4-pilot",
+        ),
+        conditions=("option","action"),
+        reward_delays=(0, 100, 300, 1000),
+    ),
+    "exp4": Sweep(
+        CellArgs(
+            env_id="DelayedChallenge-v0",
+            max_episode_steps=5_000,
+            budget=5_000_000,
+            gamma=0.999,
+            ent_coef=0.01,
+            learning_rate=1e-4,
+            anneal_lr=True,
+            discount="primitive",
+            tag="exp4",
+        ),
+        conditions=("option", "action"),
+        reward_delays=(0, 100, 300, 1000),
     ),
     "smoke": Sweep(
         CellArgs(budget=50_000, max_episode_steps=200, tag="smoke"),

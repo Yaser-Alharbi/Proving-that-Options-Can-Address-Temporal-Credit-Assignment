@@ -13,20 +13,36 @@ goal tasks differ in: `NetHackStaircase` reads the stairs_down flag,
 the oracle's glyph. All three inherit one `_reward_fn`, so one mixin covers them.
 """
 
-from typing import Any, Dict, Optional, Tuple, Type
+from collections import deque
+from typing import Any, Deque, Dict, List, Optional, Tuple, Type
 
 from nle import nethack
 from nle.env.base import NLE
-from nle.env.tasks import NetHackOracle, NetHackStaircase, NetHackStaircasePet
+from nle.env.tasks import (
+    NetHackChallenge,
+    NetHackOracle,
+    NetHackStaircase,
+    NetHackStaircasePet,
+)
 
 
 class HeldGoal:
     """On goal, banks reward and ends episode after `reward_delay` steps."""
 
+    _stream: bool = False
+    """Delay every reward by `reward_delay` primitive steps rather than latch on the goal."""
+
     def __init__(self, *args: Any, reward_delay: int = 0, **kwargs: Any) -> None:
         self._reward_delay = reward_delay
         self._held: Optional[int] = None
         self._paid = False
+        if self._stream:
+            self._pending: Deque[float] = deque()
+            self._stream_flush: Optional[List[float]] = None
+            # no `actions` or `penalty_step` default: the host already sets both,
+            # and passing either here is a duplicate keyword to its __init__
+            super().__init__(*args, **kwargs)
+            return
         # Use nethack.ACTIONS for action alignment and catalogue consistency.
  
         kwargs.setdefault("actions", nethack.ACTIONS)
@@ -37,6 +53,10 @@ class HeldGoal:
 
     def reset(self, *args: Any, **kwargs: Any) -> Tuple[Any, Dict[str, Any]]:
         """Clear the latch, then reset as usual."""
+        if self._stream:
+            self._pending.clear()
+            self._stream_flush = None
+            return super().reset(*args, **kwargs)  # type: ignore[misc]
         # before super(), because NLE.reset ends by calling _get_end_status, so a
         # game that starts the agent on a staircase would latch during it
         self._held = None
@@ -45,6 +65,8 @@ class HeldGoal:
 
     def _is_episode_end(self, observation: Any) -> int:
         """RUNNING until `reward_delay` steps after the task was first solved."""
+        if self._stream:
+            return super()._is_episode_end(observation)  # type: ignore[misc]
         status = super()._is_episode_end(observation)  # type: ignore[misc]
         if self._held is None:
             if status != self.StepStatus.TASK_SUCCESSFUL:  # type: ignore[attr-defined]
@@ -63,6 +85,23 @@ class HeldGoal:
         end_status: int,
     ) -> float:
         """Terminal step pays banked 1 plus time penalty."""
+        if self._stream:
+            earned = super()._reward_fn(  # type: ignore[misc]
+                last_observation, action, observation, end_status
+            )
+            if self._reward_delay == 0:
+                return earned
+            self._pending.append(earned)
+            if end_status != self.StepStatus.RUNNING:  # type: ignore[attr-defined]
+                # the queue is cleared below, so this copy is the whole handoff
+                # to `StreamFlushClip`, which consumes it and nulls it
+                self._stream_flush = list(self._pending)
+                flushed = sum(self._pending)
+                self._pending.clear()
+                return flushed
+            if len(self._pending) <= self._reward_delay:
+                return 0.0
+            return self._pending.popleft()
    
         del action
         time_penalty = self._get_time_penalty(  # type: ignore[attr-defined]
@@ -108,3 +147,7 @@ forwards it, so NLE's internal horizon would stay at the 5000-step default; and 
 the held reward is never flushed. Leaving these unregistered makes that trap
 unreachable rather than documented.
 """
+
+DELAYED_ENVS["DelayedChallenge-v0"] = type(
+    "DelayedChallenge", (HeldGoal, NetHackChallenge), {"_stream": True}
+)

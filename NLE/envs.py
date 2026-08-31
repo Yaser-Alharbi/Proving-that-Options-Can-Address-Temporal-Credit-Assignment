@@ -1,7 +1,8 @@
-from typing import Callable, Literal
+from typing import Callable, Literal, SupportsFloat
 
 import gymnasium as gym
 import nle  # noqa: F401  registers NetHack envs with gymnasium
+import numpy as np
 from nle.env.base import NLE
 from nle.env.tasks import NetHackStaircase
 
@@ -18,6 +19,23 @@ TASK_SUCCESSFUL = int(NetHackStaircase.StepStatus.TASK_SUCCESSFUL)
 
 STATUS_RUNNING = int(NLE.StepStatus.RUNNING)
 """`end_status` when the game itself did not end. Gymnasium TimeLimit truncations write no xlogfile."""
+
+
+class StreamFlushClip(gym.RewardWrapper):
+    """Rewrites a stream terminal flush as the sum of its individually clipped items.
+
+    A flush is many primitive steps arriving as one scalar, so `ClipReward` below
+    truncates the whole episode's banked reward to `REWARD_CLIP`. Clipping each
+    banked item instead makes the clipped total delay-invariant.
+    """
+
+    def reward(self, reward: SupportsFloat) -> SupportsFloat:
+        """The wrapped reward, unless the inner env just flushed its pending queue."""
+        flushed = self.unwrapped._stream_flush
+        if flushed is None:
+            return reward
+        self.unwrapped._stream_flush = None
+        return float(np.clip(flushed, -REWARD_CLIP, REWARD_CLIP).sum())
 
 
 def make_nle(env_id: str, max_episode_steps: int, reward_delay: int = 0) -> gym.Env:
@@ -61,6 +79,8 @@ def make_env(
         if clip_reward:
             # below OptionWrapper so the clip is per primitive, not per decision
             env = gym.wrappers.ClipReward(env, -REWARD_CLIP, REWARD_CLIP)
+            if env_id == "DelayedChallenge-v0":
+                env = StreamFlushClip(env)
         rows, _, _ = make_options(
             env.unwrapped.actions, condition, n_options, option_family, option_seed
         )

@@ -4,15 +4,22 @@ import csv
 import pathlib
 import subprocess
 import sys
-from typing import TYPE_CHECKING, Any, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import gymnasium as gym
 import numpy as np
 import pytest
+from nle.env.base import NLE
 from nle.env.tasks import NetHackOracle, NetHackStaircase, NetHackStaircasePet
 
 from delayed import DELAYED_ENVS, HeldGoal
-from envs import OBSERVATION_KEYS, TASK_SUCCESSFUL, make_env
+from envs import (
+    OBSERVATION_KEYS,
+    REWARD_CLIP,
+    TASK_SUCCESSFUL,
+    StreamFlushClip,
+    make_env,
+)
 from options import _catalogue, catalogue_digest
 
 if TYPE_CHECKING:
@@ -306,7 +313,7 @@ def test_each_delayed_id_mixes_the_hold_over_its_own_predicate() -> None:
         "DelayedStaircasePet-v0": NetHackStaircasePet,
         "DelayedOracle-v0": NetHackOracle,
     }
-    assert set(DELAYED_ENVS) == set(hosts)
+    assert set(DELAYED_ENVS) == set(hosts) | {"DelayedChallenge-v0"}
     for env_id, task in hosts.items():
         mro = DELAYED_ENVS[env_id].__mro__
         assert mro.index(HeldGoal) < mro.index(task)
@@ -369,3 +376,207 @@ def test_the_delay_reaches_the_env_through_make_env() -> None:
     assert isinstance(inner, HeldGoal)
     assert inner._reward_delay == reward_delay
     assert inner._max_episode_steps == HORIZON
+
+
+STREAM_DELAYS = (0, 100, 300, 1000)
+"""The exp4-pilot ladder."""
+
+STREAM_EPISODE_STEPS = 1200
+"""Longer than the longest delay, so some items dequeue before the flush and some do not."""
+
+STREAM_REWARDS = (
+    (11, 6.0),
+    (148, -4.0),
+    (300, -13.0),
+    (500, 0.5),
+    (700, -0.25),
+    (950, 3.0),
+    (1110, 28.0),
+    (1150, 7.5),
+)
+"""`(step, reward)`, both signs and either side of `REWARD_CLIP`.
+
+Placed so every delay's flush window holds more than one clippable item. Where a
+window holds one, clipping the sum and clipping each item agree and the bug is
+silent: an evenly spaced series only fails at delay 1000.
+"""
+
+STREAM_SENTINEL = 0.125
+"""An in-clip value that is not the flush sum, so a re-read would be visible."""
+
+TERMINAL_STATUSES = ("DEATH", "ABORTED")
+
+
+def reward_series() -> List[float]:
+    """One episode of scripted per-step rewards, zero except at the `STREAM_REWARDS` steps."""
+    series = [0.0] * STREAM_EPISODE_STEPS
+    for step, value in STREAM_REWARDS:
+        series[step] = value
+    return series
+
+
+class RewardSeriesHost(gym.Env):
+    """NLE-shaped host that pays a scripted reward per step and ends on the last one."""
+
+    StepStatus = NLE.StepStatus
+    action_space = gym.spaces.Discrete(1)
+    observation_space = gym.spaces.Discrete(1)
+
+    def __init__(self, series: List[float], terminal_status: int) -> None:
+        self._series = series
+        self._terminal_status = terminal_status
+        self._index = 0
+
+    def reset(
+        self,
+        *,
+        seed: Optional[int] = None,
+        options: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[int, Dict[str, Any]]:
+        """Rewind to the first scripted reward."""
+        del seed, options
+        self._index = 0
+        return 0, {}
+
+    def _reward_fn(
+        self,
+        last_observation: Any,
+        action: int,
+        observation: Any,
+        end_status: int,
+    ) -> float:
+        """The scripted reward for the step being taken."""
+        del last_observation, action, observation, end_status
+        return self._series[self._index]
+
+    def step(self, action: int) -> Tuple[int, float, bool, bool, Dict[str, Any]]:
+        """One step, calling `_reward_fn` with the step's `end_status` as `NLE.step` does."""
+        last = self._index == len(self._series) - 1
+        end_status = self._terminal_status if last else self.StepStatus.RUNNING
+        reward = float(self._reward_fn(0, action, 0, end_status))
+        self._index += 1
+        return 0, reward, last, False, {"end_status": int(end_status)}
+
+
+class StreamSeriesHost(HeldGoal, RewardSeriesHost):
+    """`HeldGoal` in stream mode over a scripted series, so no NetHack is booted."""
+
+    _stream = True
+
+
+def stream_stack(reward_delay: int, terminal_status: int) -> gym.Env:
+    """`make_env`'s wrap order for the stream host, over a scripted series."""
+    env: gym.Env = StreamSeriesHost(
+        reward_series(), terminal_status, reward_delay=reward_delay
+    )
+    env = gym.wrappers.RecordEpisodeStatistics(env)
+    env = gym.wrappers.ClipReward(env, -REWARD_CLIP, REWARD_CLIP)
+    return StreamFlushClip(env)
+
+
+def undelayed_stack(terminal_status: int) -> gym.Env:
+    """The same series through a host with no delay mechanism, wrapped as exp1 wraps it."""
+    env: gym.Env = RewardSeriesHost(reward_series(), terminal_status)
+    env = gym.wrappers.RecordEpisodeStatistics(env)
+    return gym.wrappers.ClipReward(env, -REWARD_CLIP, REWARD_CLIP)
+
+
+def episode_totals(env: gym.Env) -> Tuple[float, float]:
+    """`(clipped, unclipped)` episode totals, the second off `RecordEpisodeStatistics`."""
+    env.reset()
+    clipped = 0.0
+    info: Dict[str, Any] = {}
+    for _ in range(STREAM_EPISODE_STEPS):
+        _, reward, terminated, truncated, info = env.step(0)
+        clipped += float(reward)
+        if terminated or truncated:
+            break
+    assert "episode" in info, "the scripted series has to end the episode"
+    return clipped, float(info["episode"]["r"])
+
+
+@pytest.mark.parametrize("terminal_status", TERMINAL_STATUSES)
+def test_the_clipped_total_is_the_same_at_every_delay(terminal_status: str) -> None:
+    """Clipping each banked item makes the learner's total delay-invariant."""
+    status = getattr(NLE.StepStatus, terminal_status)
+    totals = [episode_totals(stream_stack(delay, status))[0] for delay in STREAM_DELAYS]
+    per_item = sum(
+        min(max(value, -REWARD_CLIP), REWARD_CLIP) for _, value in STREAM_REWARDS
+    )
+
+    assert totals == pytest.approx([per_item] * len(STREAM_DELAYS))
+
+
+@pytest.mark.parametrize("terminal_status", TERMINAL_STATUSES)
+def test_the_unclipped_total_is_the_same_at_every_delay(terminal_status: str) -> None:
+    """The delay moves reward mass through time without creating or destroying any."""
+    status = getattr(NLE.StepStatus, terminal_status)
+    totals = [episode_totals(stream_stack(delay, status))[1] for delay in STREAM_DELAYS]
+    unclipped = sum(value for _, value in STREAM_REWARDS)
+
+    assert totals == pytest.approx([unclipped] * len(STREAM_DELAYS))
+
+
+@pytest.mark.parametrize("terminal_status", TERMINAL_STATUSES)
+def test_delay_zero_is_the_undelayed_host_exactly(terminal_status: str) -> None:
+    """`reward_delay=0` is a passthrough, clipped and unclipped."""
+    status = getattr(NLE.StepStatus, terminal_status)
+
+    assert episode_totals(stream_stack(0, status)) == pytest.approx(
+        episode_totals(undelayed_stack(status))
+    )
+
+
+@pytest.mark.parametrize("terminal_status", TERMINAL_STATUSES)
+def test_a_flush_cannot_be_consumed_twice(terminal_status: str) -> None:
+    """The handoff dies on the read that spends it, so no later read re-pays the flush."""
+    status = getattr(NLE.StepStatus, terminal_status)
+    env = stream_stack(STREAM_DELAYS[-1], status)
+    env.reset()
+    for _ in range(STREAM_EPISODE_STEPS):
+        _, terminal_reward, terminated, truncated, _ = env.step(0)
+        if terminated or truncated:
+            break
+
+    assert terminal_reward > REWARD_CLIP, (
+        "the flush has to outgrow a single clip or this test passes vacuously"
+    )
+    assert env.unwrapped._stream_flush is None
+    assert env.reward(STREAM_SENTINEL) == pytest.approx(STREAM_SENTINEL)
+
+
+def wrapper_stack(env: gym.Env) -> List[type]:
+    """The wrapper classes around `env`, outermost first."""
+    stack: List[type] = []
+    while isinstance(env, gym.Wrapper):
+        stack.append(type(env))
+        env = env.env
+    return stack
+
+
+def test_only_the_stream_host_gets_the_flush_clip() -> None:
+    """`StreamFlushClip` wraps the stream host outside the per-step clip, and no latch host."""
+    common = dict(
+        seed=0,
+        idx=0,
+        condition="action",
+        gamma=0.999,
+        max_episode_steps=HORIZON,
+        clip_reward=True,
+        n_options=64,
+        option_family="grammar",
+        option_seed=0,
+        reward_delay=8,
+    )
+    stream = make_env(env_id="DelayedChallenge-v0", **common)()
+    stream_wrappers = wrapper_stack(stream)
+    stream.close()
+
+    latch = make_env(env_id=DELAYED_STAIRCASE, **common)()
+    latch_wrappers = wrapper_stack(latch)
+    latch.close()
+
+    assert stream_wrappers.index(StreamFlushClip) < stream_wrappers.index(
+        gym.wrappers.ClipReward
+    ), "the flush clip has to sit outside the per-step clip it corrects"
+    assert StreamFlushClip not in latch_wrappers

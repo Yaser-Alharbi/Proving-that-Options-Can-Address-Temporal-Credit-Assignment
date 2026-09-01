@@ -1288,8 +1288,8 @@ DISABLED = frozenset({"option_usage"})
 
 EXPERIMENT_FIGURES: Dict[str, Tuple[str, ...]] = {
     "exp1": ("return_curve", "return_ecdf", "threshold_table", "length_curve"),
-    "exp2": ("option_count_sweep", "threshold_table", "count_overlay"),
-    "exp3": ("return_curve", "threshold_table",),
+    "exp2": ("option_count_sweep", "threshold_table", "count_overlay","option_usage"),
+    "exp3": ("return_curve", "threshold_table","option_usage"),
     "exp4": ("delay_return", "delay_crossing_fraction", "delay_slack", "delay_sweep",
              "delay_advantage", "duration_vs_delay"),
 }

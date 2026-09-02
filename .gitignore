@@ -221,7 +221,6 @@ __marimo__/
 runs/
 results/
 markdowns/
-plots/
 *.md
 *logs/
 *.sh

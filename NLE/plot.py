@@ -542,8 +542,11 @@ def draw_bands(axis: Axes, table: pd.DataFrame, varying: Sequence[str],
     structured families keep their `STRUCTURED_COLOR`.
     """
     # the seed count and method go in the caption where every cell agrees, which is the
-    # usual case, and stay on the entry where a short cell fell back to median-and-range
-    suffix = "" if shared_estimate(table) else " ({} seeds, {})"
+    # usual case; where they disagree the entry names the estimator alone. The counts are
+    # left off: pooling the draws of a family into one series makes them differ by
+    # construction, and the reader is owed which estimator drew the band, not how wide the
+    # pool behind it was.
+    suffix = "" if shared_estimate(table) else " ({})"
     seed_colors: Optional[Dict[int, Tuple[float, float, float, float]]] = None
     if colors is None and "option_seed" in varying:
         drawn = table[(table.condition != "action")
@@ -572,8 +575,7 @@ def draw_bands(axis: Axes, table: pd.DataFrame, varying: Sequence[str],
                   else ("-" if counted else BASELINE_DASH),
                   label=f"n={first.n_options:g}" if counted else
                   series_label(first, varying)
-                  + suffix.format(int(first.n_seeds),
-                                  METHOD_PHRASE.get(first.method, first.method)))
+                  + suffix.format(METHOD_PHRASE.get(first.method, first.method)))
         axis.fill_between(group.primitive_step, group.low, group.high, color=color,
                           alpha=DRAW_BAND_ALPHA if seed_colors is not None else BAND_ALPHA,
                           linewidth=0, edgecolor="none")
@@ -951,7 +953,7 @@ def option_count_sweep(data: Inputs) -> Tuple[Figure, pd.DataFrame]:
     ]).sort_values(keys + ["n_options"])
     # n_options is the x axis, so it never names a series
     varying = [key for key in varying_fields(table) if key != "n_options"]
-    suffix = "" if shared_estimate(table) else " ({} seeds, {})"
+    suffix = "" if shared_estimate(table) else " ({})"
 
     figure, axis = plt.subplots(figsize=FIGURE_SIZE)
     for _, group in table.groupby(keys, dropna=False):
@@ -963,8 +965,7 @@ def option_count_sweep(data: Inputs) -> Tuple[Figure, pd.DataFrame]:
             color=CONDITION_COLOR[first.condition], marker="o", capsize=ERROR_CAP_SIZE,
             linestyle=FAMILY_DASH.get(first.family, "-"),
             label=series_label(first, varying)
-            + suffix.format(int(first.n_seeds),
-                            METHOD_PHRASE.get(first.method, first.method)),
+            + suffix.format(METHOD_PHRASE.get(first.method, first.method)),
         )
     axis.set_xscale("log", base=2)
     axis.set_xticks(sorted(table.n_options.unique()))

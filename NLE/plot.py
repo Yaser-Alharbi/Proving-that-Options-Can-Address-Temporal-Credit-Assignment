@@ -362,6 +362,10 @@ def aggregate_curve(data: Inputs, frame: pd.DataFrame, column: str,
         result = estimate(curves, strata, data.args.resamples, rng)
         tables.append(pd.DataFrame({
             "cell": name, "group": cell.group.iloc[0], **first_of(cell),
+            # `first_of` takes one `option_seed`, which is the whole story only where a cell
+            # holds one draw; a cell pooling several is one line over all of them
+            "n_draws": (int(cell.option_seed.nunique()) if "option_seed" in cell.columns
+                        else 1),
             "primitive_step": grid, "point": result.point, "low": result.low,
             "high": result.high, "method": result.method, "n_seeds": result.n_seeds,
             "limit": end,
@@ -470,6 +474,11 @@ def series_label(row: pd.Series, varying: Sequence[str]) -> str:
     parts = ([CONDITION_LABEL[row.condition]] if "condition" in varying or not named else [])
     parts += [f"{FIELD_PREFIX.get(key, key + '=')}{short(str(row[key]))}"
               for key in named]
+    # what a pooled cell is an estimate over: `option_seed` does not vary across it, so
+    # nothing above says the line stands for more than the one draw it is labelled with
+    draws = int(row.get("n_draws", 1))
+    if draws > 1:
+        parts.append(f"{draws} draws")
     return ", ".join(parts)
 
 def shared_estimate(table: pd.DataFrame) -> str:
@@ -855,21 +864,32 @@ def length_curve(data: Inputs) -> Tuple[Figure, pd.DataFrame]:
                         "primitive steps per paid episode")
 
 def family_overlay(data: Inputs) -> Tuple[Figure, pd.DataFrame]:
-    """Return curves of the catalogue families, one panel per catalogue size."""
+    """Return curves of the catalogue families, one panel per catalogue size.
+
+    The action baseline, where the group ran one, is repeated into every panel: it holds no
+    catalogue, so it sizes with none of them and is what all of them are read against.
+    """
     frame = require_columns(data.episodes, ("primitive_step", "episodic_return", "family"),
                             "overlay")
-    frame = frame[frame.condition != "action"]
-    counts = [n for n, panel in frame.groupby("n_options") if panel.family.nunique() > 1]
-    for count in sorted(set(frame.n_options.unique()) - set(counts)):
+    options = frame[frame.condition != "action"]
+    counts = [n for n, panel in options.groupby("n_options") if panel.family.nunique() > 1]
+    for count in sorted(set(options.n_options.unique()) - set(counts)):
         warn(f"family_overlay drops n={count}: only one family was run at it")
     if not counts:
         raise MissingData("no catalogue size has more than one family")
 
-    frame = frame[frame.n_options.isin(counts)]
+    options = options[options.n_options.isin(counts)]
     rng = np.random.default_rng(BOOTSTRAP_SEED)
-    tables = [aggregate_curve(data, frame[frame.n_options == count], "episodic_return", rng)
-              for count in counts]
-    combined = pd.concat(tables, ignore_index=True)
+    baseline = frame[frame.condition == "action"]
+    # aggregated once and repeated, not once per panel: a second call would bootstrap the
+    # same cell off a mutated rng and draw the one baseline with a different band in each
+    reference = (aggregate_curve(data, baseline, "episodic_return", rng)
+                 if not baseline.empty else pd.DataFrame())
+    drawn = [aggregate_curve(data, options[options.n_options == count], "episodic_return", rng)
+             for count in counts]
+    tables = [table if reference.empty else pd.concat([reference, table], ignore_index=True)
+              for table in drawn]
+    combined = pd.concat(drawn if reference.empty else [reference, *drawn], ignore_index=True)
     # n_options titles the panel, so it never names a series inside one
     varying = [key for key in varying_fields(combined) if key != "n_options"]
 
